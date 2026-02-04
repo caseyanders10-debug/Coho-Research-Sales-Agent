@@ -2,71 +2,43 @@ import asyncio
 import os
 from playwright.async_api import async_playwright
 
-# Configuration - Replace these with your actual data or email parser output
-HOTELS = [
-    {"name": "The Ritz-Carlton New York", "url": "https://www.ritzcarlton.com/en/hotels/nycsh-the-ritz-carlton-new-york-central-park/overview/"},
-    # Add more hotels here
-]
-
-async def capture_hotel_data(hotel):
+async def capture_hotel_data(hotel_name, hotel_url):
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True) # GitHub Actions needs headless=True
-        context = await browser.new_context(viewport={'width': 1280, 'height': 800})
+        # We use a real "User Agent" to avoid being blocked as a bot
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         page = await context.new_page()
 
-        print(f"--- Processing: {hotel['name']} ---")
-
-        # --- STEP 1: Property Website & Screenshot ---
         try:
-            await page.goto(hotel['url'], wait_until="networkidle")
-            # Logic to find "Book" buttons (looks for common keywords)
-            book_button = page.get_by_role("button", name="Book").or_(page.get_by_text("Reserve", exact=False))
+            print(f"Visiting {hotel_name}...")
+            await page.goto(hotel_url, wait_until="domcontentloaded", timeout=60000)
+
+            # 1. Handle Cookie Banners (Crucial for Ritz/Marriott)
+            for text in ["Accept", "Agree", "OK"]:
+                banner_button = page.get_by_role("button", name=text, exact=False)
+                if await banner_button.is_visible():
+                    await banner_button.click()
+                    break
+
+            # 2. Find ANY button that looks like a Booking button
+            # This looks for 'Book', 'Reserve', or 'Check Rates'
+            booking_btn = page.locator("button, a").filter(has_text="/Book|Reserve|Check Rates/i").first
             
-            if await book_button.is_visible():
-                await book_button.click()
-                await page.wait_for_timeout(3000) # Wait for engine to load
+            if await booking_btn.is_visible():
+                await booking_btn.click()
+                await page.wait_for_timeout(5000) # Wait for engine to slide in
             
-            # Save the screenshot
+            # 3. Take the Snapshot
             os.makedirs("screenshots", exist_ok=True)
-            screenshot_path = f"screenshots/{hotel['name'].replace(' ', '_')}_booking.png"
-            await page.screenshot(path=screenshot_path)
-            print(f"Successfully captured snapshot: {screenshot_path}")
-        except Exception as e:
-            print(f"Error on property site: {e}")
-
-        # --- STEP 2: Travel Weekly GDS Search ---
-        try:
-            await page.goto("https://www.travelweekly.com/hotels", wait_until="networkidle")
-            
-            # Fill the search bar
-            search_input = page.get_by_placeholder("Hotel Name or Location")
-            await search_input.fill(hotel['name'])
-            await page.keyboard.press("Enter")
-            await page.wait_for_load_state("networkidle")
-
-            # Click the first result
-            first_result = page.locator(".hotel-search-results a").first
-            await first_result.click()
-            await page.wait_for_load_state("networkidle")
-
-            # Extract GDS Codes
-            # Travel Weekly often puts these in a specific table or list
-            gds_section = page.locator("text=GDS Reservation Codes")
-            if await gds_section.is_visible():
-                content = await page.locator(".hotel-details-table").inner_text()
-                print(f"GDS Info found for {hotel['name']}")
-                # You can use regex here to specifically grab the 2-digit chain code
-            else:
-                print(f"GDS section not found for {hotel['name']}")
+            path = f"screenshots/{hotel_name.replace(' ', '_')}.png"
+            await page.screenshot(path=path, full_page=True)
+            print(f"✅ Saved snapshot to {path}")
 
         except Exception as e:
-            print(f"Error on Travel Weekly: {e}")
+            print(f"❌ Error: {e}")
+        finally:
+            await browser.close()
 
-        await browser.close()
-
-async def main():
-    for hotel in HOTELS:
-        await capture_hotel_data(hotel)
-
+# Run it!
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(capture_hotel_data("Ritz Carlton NY", "https://www.ritzcarlton.com/en/hotels/nycsh-the-ritz-carlton-new-york-central-park/overview/"))
