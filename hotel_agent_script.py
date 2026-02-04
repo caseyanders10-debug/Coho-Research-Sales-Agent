@@ -39,6 +39,16 @@ async def capture_hotel_data(hotel_name, hotel_url):
         finally:
             await browser.close()
 
-# Run it!
+# This is the "Main" part of the script
 if __name__ == "__main__":
+    # 1. Create the folder first so the computer doesn't get confused
+    os.makedirs("screenshots", exist_ok=True)
+    
+    # 2. Run your hotel research
     asyncio.run(capture_hotel_data("Ritz Carlton NY", "https://www.ritzcarlton.com/en/hotels/nycsh-the-ritz-carlton-new-york-central-park/overview/"))
+    
+    # 3. YOUR NEW LINE: This forces a file to exist so the "Artifacts" section appears!
+    open('screenshots/success_log.txt', 'w').write('Agent finished run')
+
+# Run it!
+
