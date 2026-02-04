@@ -1,26 +1,43 @@
 name: Hotel Intelligence Agent
+
 on:
-  workflow_dispatch: # Allows you to run it manually with one click
+  workflow_dispatch:
+    # This section creates the "Text Box" you were looking for!
+    inputs:
+      email_body:
+        description: 'Paste the raw email content here'
+        required: true
+        type: string
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+
       - name: Install Dependencies
         run: |
-          pip install playwright google-generativeai
-          playwright install chromium
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
       - name: Run Agent
+        # This maps your GitHub Secrets and the Text Box input to the Python script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          EMAIL_INPUT: ${{ github.event.inputs.email_body }}
         run: python hotel_agent_script.py
+
       - name: Upload Screenshots
+        # This part saves the photos so you can download them later
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: hotel-snapshots
-          path: screenshots/*.png
+          path: screenshots/
