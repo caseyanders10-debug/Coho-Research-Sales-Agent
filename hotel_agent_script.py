@@ -36,27 +36,42 @@ async def conduct_research(hotel):
             await page.screenshot(path=f"screenshots/{name.replace(' ', '_')}_site.png")
         except: pass
 
-        # PART 2: Travel Weekly GDS Search
+       # TRAVEL WEEKLY SEARCH (Refined for 2026)
         try:
-            print(f"🔎 Researching {name} on Travel Weekly...")
+            print(f"🔎 Initiating search for: {name}...")
             await page.goto("https://www.travelweekly.com/hotels", wait_until="domcontentloaded")
             
-            search_box = page.locator("#hotelName, input[placeholder*='Hotel Name']").first
+            # 1. FIND THE INPUT: Using multiple possible selectors for the property name box
+            # This covers the 'Hotel Name' placeholder you see on the site
+            search_box = page.locator("#hotelName, input[name*='HotelName'], .hotel-search-input").first
+            await search_box.wait_for(state="visible", timeout=15000)
+            
+            # 2. CLICK & TYPE: Simulating human keyboard strokes to trigger the search engine
             await search_box.click()
-            await page.keyboard.type(name, delay=100) 
-            await page.keyboard.press("Enter")
+            await search_box.fill("") # Clear it first
+            await page.keyboard.type(name, delay=120) # 120ms delay mimics human typing
             
-            await page.wait_for_timeout(5000)
+            # 3. THE BUTTON: Specifically clicking the 'Search Hotels' button
+            # We look for the button with the actual text 'Search Hotels' or the magnifying glass
+            search_btn = page.locator("button:has-text('Search'), .search-button, input[type='submit']").first
+            await search_btn.click()
             
+            # 4. WAIT & CLICK DETAILS: Essential to get to the GDS codes
+            await page.wait_for_timeout(6000) # Wait for results to populate
+            
+            # Look for 'View Hotel Details' to enter the property's specific page
             details_link = page.get_by_text("View Hotel Details").first
             if await details_link.is_visible():
                 await details_link.click()
                 await page.wait_for_load_state("networkidle")
                 await page.wait_for_timeout(3000)
+            
+            await page.screenshot(path=f"screenshots/{name.replace(' ', '_')}_GDS_SEARCH.png", full_page=True)
+            print(f"✅ Captured GDS Search for {name}")
 
-            await page.screenshot(path=f"screenshots/{name.replace(' ', '_')}_GDS_RESEARCH.png", full_page=True)
         except Exception as e:
-            print(f"❌ GDS Fail for {name}: {e}")
+            print(f"❌ Travel Weekly Search failed: {e}")
+            await page.screenshot(path=f"screenshots/{name.replace(' ', '_')}_SEARCH_FAILED.png")
 
         await browser.close()
 
