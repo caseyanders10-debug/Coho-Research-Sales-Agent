@@ -2,4 +2,3 @@ playwright
 google-genai
 httpx
 beautifulsoup4
-
