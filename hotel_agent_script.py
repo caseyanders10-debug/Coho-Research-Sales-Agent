@@ -8,8 +8,8 @@ HOTEL_NAME = os.environ.get("EMAIL_INPUT", "The Reeds at Shelter Haven")
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 async def ask_gemini_with_retry(name, retries=3):
-    """AI handles the heavy lifting for GDS and Phone."""
-    prompt = (f"Provide GDS codes and the official reservation phone number for '{name}'. "
+    """Primary data pull: GDS + Phone."""
+    prompt = (f"Provide GDS codes and the official phone number for '{name}'. "
               "Return ONLY JSON: {'chain': 'PW', 'sabre': '192496', 'amadeus': 'WWDRSH', "
               "'apollo': '44708', 'worldspan': 'ACYRS', 'phone': '609-368-0100'}")
     for i in range(retries):
@@ -23,12 +23,12 @@ async def ask_gemini_with_retry(name, retries=3):
     return None
 
 async def main():
+    # 1. Setup folder immediately
     os.makedirs("screenshots", exist_ok=True)
     
-    # 1. GET DATA
+    # 2. GET DATA & SAVE IMMEDIATELY
     data = await ask_gemini_with_retry(HOTEL_NAME)
     
-    # 2. SAVE FORMATTED REPORT (Professional Layout)
     if data:
         c = data.get('chain', '??')
         report = (
@@ -43,28 +43,31 @@ async def main():
             f"WORLDSPAN: {c}{data.get('worldspan', 'N/A')}\n"
             f"-----------------------------"
         )
-        with open(f"screenshots/GDS_REPORT.txt", "w") as f:
+        # We write this NOW so it exists even if the browser crashes later
+        with open("screenshots/GDS_REPORT.txt", "w") as f:
             f.write(report)
-        print("✅ Professional report generated.")
+        print("✅ GDS_REPORT.txt saved to folder.")
 
-    # 3. WEB PROOF (Bypassing Search Engines to avoid CAPTCHAs)
-    print("🌐 Capturing visual proof (Bypassing Search Engines)...")
+    # 3. WEB PROOF (Using Bing to bypass Google's Redirect Notice)
+    print("🌐 Capturing visual proof via Bing...")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         try:
-            # We skip the search results and go to a common directory or use a direct URL guess
-            # TravelWeekly's property page is often less restricted than their search page
-            direct_url = f"https://www.google.com/search?q={HOTEL_NAME.replace(' ', '+')}&btnI"
-            await page.goto(direct_url, wait_until="domcontentloaded", timeout=20000)
+            # Bing is less likely to show 'Redirect Notices' or 'Duck CAPTCHAs'
+            bing_url = f"https://www.bing.com/search?q={HOTEL_NAME.replace(' ', '+')}+official+site"
+            await page.goto(bing_url, wait_until="networkidle")
             
-            # Take a full-page screenshot of wherever we land (the official site)
+            # Click the first big result link
+            await page.locator("li.b_algo h2 a").first.click()
+            await page.wait_for_load_state("networkidle")
+            
+            # Final Screenshot
             await page.screenshot(path="screenshots/Booking_Engine_Proof.png", full_page=True)
-            print("📸 Web proof saved.")
-        except:
-            # If all else fails, screenshot the AI's best guess for the homepage
-            print("⚠️ Direct nav failed, providing fallback capture.")
-            await page.screenshot(path="screenshots/web_fallback.png")
+            print("📸 Booking_Engine_Proof.png saved.")
+        except Exception as e:
+            print(f"⚠️ Web proof encountered an issue: {e}")
+            await page.screenshot(path="screenshots/web_stuck_debug.png")
         finally:
             await browser.close()
 
