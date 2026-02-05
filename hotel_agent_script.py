@@ -9,84 +9,81 @@ EMAIL_BODY = os.environ.get("EMAIL_INPUT", "The Reeds at Shelter Haven")
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 async def ask_gemini_for_gds(hotel_name):
-    """Commands Gemini for REAL codes (no placeholders)."""
-    await asyncio.sleep(5) # Rate limit protection
+    """Commands Gemini for real codes with rate-limit protection."""
+    await asyncio.sleep(5) # Cooldown after starting
     prompt = (
-        f"Identify the ACTUAL GDS Chain Code and Property IDs for: '{hotel_name}'. "
-        "Do not use placeholders like '123'. Search for real values. "
-        "Return ONLY a JSON object: {'found': true, 'chain': '...', 'sabre': '...', 'amadeus': '...', 'apollo': '...', 'worldspan': '...'}"
+        f"Provide the ACTUAL GDS Chain Code (2-letter) and Property IDs for: '{hotel_name}'. "
+        "No placeholders. Return ONLY JSON: {'found': true, 'chain': '...', 'sabre': '...', 'amadeus': '...', 'apollo': '...', 'worldspan': '...'}"
     )
     try:
         response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
-        # Clean any markdown formatting from the AI
+        # Scrub markdown code blocks if present
         clean_json = response.text.strip().replace('```json', '').replace('```', '')
         return json.loads(clean_json)
-    except:
+    except Exception as e:
+        print(f"⚠️ AI Step failed/skipped (Rate Limit): {e}")
         return {"found": False}
 
 async def conduct_web_research(hotel_name):
-    """The 'Nuclear' Browser Option: Bypasses overlays and clicks the property list."""
+    """Bypasses cookie banners and forces the search results click."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         try:
-            print(f"🔎 Navigating to Travel Weekly for: {hotel_name}")
+            print(f"🔎 AI data unavailable. Searching Travel Weekly for: {hotel_name}")
             await page.goto("https://www.travelweekly.com/Hotels", wait_until="domcontentloaded")
             
             # --- NUCLEAR OVERLAY REMOVAL ---
-            # This deletes the OneTrust banner that causes your 30s timeouts
+            # Physically deletes the OneTrust filter that causes the 30s timeout
             await page.evaluate("""() => {
-                const blockers = document.querySelectorAll('.onetrust-pc-dark-filter, #onetrust-consent-sdk, .optanon-alert-box-wrapper');
-                blockers.forEach(el => el.remove());
+                document.querySelectorAll('.onetrust-pc-dark-filter, #onetrust-consent-sdk').forEach(el => el.remove());
                 document.body.style.overflow = 'visible';
             }""")
             
-            # Perform Search
-            search_input = page.locator("input[placeholder*='name or destination']").first
-            await search_input.fill(hotel_name)
+            # Type and Search
+            search_box = page.locator("input[placeholder*='name or destination']").first
+            await search_box.fill(hotel_name)
             await page.locator("button:has-text('Search Hotels')").first.click(force=True)
-            
-            # Wait for results to populate
             await page.wait_for_timeout(5000)
 
-            # --- THE SELECTION PAGE FIX ---
-            # This clicks the property link under the 'Hotels' header (image_a52f1d.png)
+            # --- SELECT THE CORRECT PROPERTY ---
+            # Specifically targets the list under the 'Hotels' header in your screenshot
             if await page.get_by_text("Hotel Search Selection").is_visible():
-                print("📋 Selection page detected. Forcing click on first hotel result...")
+                print("📋 Selection page detected. Forcing click on property link...")
                 await page.locator("h3:has-text('Hotels') + ul li a").first.click(force=True)
                 await page.wait_for_timeout(3000)
 
-            # Click Details for the final GDS Table
+            # Final 'View Details' to reach GDS table
             details = page.get_by_text("View Hotel Details").first
             if await details.is_visible():
                 await details.click(force=True)
                 await page.wait_for_load_state("networkidle")
 
-            # Final Proof Screenshot
-            path = f"screenshots/{hotel_name.replace(' ', '_')}_Final_GDS.png"
-            await page.screenshot(path=path, full_page=True)
-            print(f"✅ GDS captured successfully at {path}")
-            
+            # Capture the actual GDS Table
+            filename = f"screenshots/{hotel_name.replace(' ', '_')}_Final_Table.png"
+            await page.screenshot(path=filename, full_page=True)
+            print(f"✅ GDS captured at {filename}")
         finally:
             await browser.close()
 
 async def main():
     os.makedirs("screenshots", exist_ok=True)
-    name = EMAIL_BODY
+    # Step 1: Try AI first
+    data = await ask_gemini_for_gds(EMAIL_BODY)
     
-    # Step 1: Try AI
-    data = await ask_gemini_for_gds(name)
-    
-    # Step 2: Validate if AI gave real data (not '123')
-    if data.get('found') and data.get('sabre') != "123":
+    # Check for real data (not placeholders)
+    if data.get('found') and data.get('sabre') not in ["123", "placeholder"]:
         c = data['chain']
-        report = f"PROPERTY: {name}\nCHAIN: {c}\nSABRE: {c}{data['sabre']}\nAMADEUS: {c}{data['amadeus']}"
-        with open(f"screenshots/{name.replace(' ', '_')}_GDS.txt", "w") as f:
+        report = f"PROPERTY: {EMAIL_BODY}\nCHAIN: {c}\nSABRE: {c}{data['sabre']}\nAMADEUS: {c}{data['amadeus']}"
+        with open(f"screenshots/{EMAIL_BODY.replace(' ', '_')}_GDS.txt", "w") as f:
             f.write(report)
-        print(f"✨ SUCCESS: AI identified the {c} codes.")
+        print(f"✨ AI SUCCESS: Found {c} codes.")
     else:
-        # Step 3: Run the updated web search if AI failed or gave fake data
-        await conduct_web_research(name)
+        # Step 2: Full web search backup
+        await conduct_web_research(EMAIL_BODY)
+    
+    # Final cooldown for rate limits
+    await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(main())
