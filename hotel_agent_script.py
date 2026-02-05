@@ -18,14 +18,13 @@ async def get_hotel_info_from_ai(text):
 
 def clean_hotel_name(name):
     """Removes common 'noise' words to help Travel Weekly find a match."""
-    # Remove 'The', 'Hotel', 'Resort', 'Spa', 'LLC', '&', and extra spaces
     noise_words = r"\b(the|hotel|resort|spa|llc|inc|suites|club|inn|and)\b"
     cleaned = re.sub(noise_words, "", name, flags=re.IGNORECASE)
-    cleaned = re.sub(r"[^\w\s]", " ", cleaned) # Remove punctuation like '&' or '-'
-    return " ".join(cleaned.split()) # Remove double spaces
+    cleaned = re.sub(r"[^\w\s]", " ", cleaned)
+    return " ".join(cleaned.split())
 
 async def clear_blockers(page):
-    """Clicks 'Close' or 'Accept' on known cookie banners."""
+    """Clicks 'Close' or 'Accept' on the banner seen in your screenshot."""
     selectors = ["button:has-text('Close')", "button:has-text('Accept')", "#onetrust-accept-btn-handler"]
     for s in selectors:
         try:
@@ -33,24 +32,50 @@ async def clear_blockers(page):
             if await btn.is_visible(): await btn.click(force=True)
         except: pass
 
+async def handle_selection_page(page, original_name):
+    """Handles the 'Hotel Search Selection' list from your screenshot."""
+    print(f"📋 Selection page detected. Looking for {original_name}...")
+    # Look for the hotel name specifically under the 'Hotels' header
+    try:
+        # This finds the link in the 'Hotels' list that matches your property
+        hotel_link = page.locator("h3:has-text('Hotels') + ul li a, .hotel-list a").filter(has_text=original_name[:10]).first
+        if await hotel_link.is_visible():
+            await hotel_link.click()
+            await page.wait_for_load_state("networkidle")
+            return True
+    except:
+        pass
+    return False
+
 async def search_travel_weekly(page, name):
-    """Encapsulated search logic to allow for retries with cleaned names."""
+    """Improved search logic that handles the selection list."""
     print(f"🔎 Searching Travel Weekly for: {name}")
     await page.goto("https://www.travelweekly.com/Hotels", wait_until="domcontentloaded")
     await clear_blockers(page)
     
     search_box = page.locator("#hotelName, input[placeholder*='Hotel Name']").first
-    await search_box.wait_for(state="visible", timeout=10000)
-    await search_box.fill("") # Clear
+    await search_box.wait_for(state="visible", timeout=15000)
+    await search_box.fill("") 
     await page.keyboard.type(name, delay=100)
     await page.locator("button:has-text('Search Hotels'), .btn-primary").first.click()
     
     await page.wait_for_timeout(5000)
+
+    # CHECK 1: Are we on the selection page from your screenshot?
+    if "Search Selection" in await page.title() or await page.get_by_text("Results for").is_visible():
+        await handle_selection_page(page, name)
+
+    # CHECK 2: Look for the final 'View Hotel Details' button
     details = page.get_by_text("View Hotel Details").first
     if await details.is_visible():
         await details.click()
         await page.wait_for_load_state("networkidle")
         return True
+    
+    # Check if we landed directly on a page with GDS codes
+    if await page.get_by_text("GDS Reservation Codes").is_visible():
+        return True
+        
     return False
 
 async def conduct_research(hotel):
@@ -61,23 +86,26 @@ async def conduct_research(hotel):
         name = hotel.get("name")
         os.makedirs("screenshots", exist_ok=True)
 
-        # 1. Official Site / Booking Engine
+        # 1. Official Site (Finding the Booking Engine)
         try:
             await page.goto(hotel.get("url"), wait_until="networkidle", timeout=45000)
             await clear_blockers(page)
-            # Take snapshot for proof of official site
-            await page.screenshot(path=f"screenshots/{name}_Official.png")
+            # Try to click a booking trigger
+            for t in ["Book", "Reserve", "Availability"]:
+                btn = page.get_by_text(t, exact=False).first
+                if await btn.is_visible():
+                    await btn.click(force=True)
+                    await page.wait_for_timeout(3000)
+                    break
+            await page.screenshot(path=f"screenshots/{name}_Official_Booking.png")
         except: pass
 
-        # 2. Travel Weekly with "Clean Name" Retry
+        # 2. Travel Weekly (Handling the selection list)
         try:
-            # Try 1: Original Name
             success = await search_travel_weekly(page, name)
             
-            # Try 2: Cleaned Name (If first one failed)
             if not success:
                 cleaned = clean_hotel_name(name)
-                print(f"⚠️ No results for '{name}'. Retrying with cleaned name: '{cleaned}'")
                 success = await search_travel_weekly(page, cleaned)
 
             suffix = "GDS_DATA" if success else "NOT_FOUND"
