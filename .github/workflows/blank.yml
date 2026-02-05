@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       email_body:
-        description: 'Paste the raw email content here'
+        description: 'Paste the raw email content or hotel name here'
         required: true
         type: string
 
@@ -33,6 +33,11 @@ jobs:
         run: mkdir -p screenshots
 
       - name: Run Agent
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          EMAIL_INPUT: ${{ github.event.inputs.email_body }}
+        run: python hotel_agent_script.py
+
       - name: Debug - list workspace and screenshots
         if: always()
         run: |
@@ -41,13 +46,8 @@ jobs:
           ls -la
           echo "Screenshots dir:"
           ls -la screenshots || true
-          echo "Find any png/json/txt:"
+          echo "Find any png/json/txt/html:"
           find . -maxdepth 3 -type f \( -name "*.png" -o -name "*.json" -o -name "*.txt" -o -name "*.html" \) -print
-
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          EMAIL_INPUT: ${{ github.event.inputs.email_body }}
-        run: python hotel_agent_script.py
 
       - name: Upload Screenshots
         if: always()
