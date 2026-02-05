@@ -1,92 +1,90 @@
 import asyncio
 import os
 import json
+import re
 from google import genai
-from tenacity import retry, stop_after_attempt, wait_random_exponential
 from playwright.async_api import async_playwright
 
 # --- CONFIGURATION ---
-EMAIL_BODY = os.environ.get("EMAIL_INPUT", "No email provided")
+EMAIL_BODY = os.environ.get("EMAIL_INPUT", "The Reeds at Shelter Haven")
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 async def ask_gemini_for_gds(hotel_name):
-    """Commands Gemini to search and provide the codes directly."""
-    # We add a delay here to avoid the 429 Resource Exhausted error
-    await asyncio.sleep(2) 
+    """Commands Gemini with a strict format to prevent parsing errors."""
+    await asyncio.sleep(5) # Cooldown to prevent 'Resource Exhausted'
+    
     prompt = (
-        f"Provide the GDS Chain Code (2-letter) and Property IDs for: '{hotel_name}'. "
-        "Return ONLY a JSON object: {'found': true, 'chain': '...', 'sabre': '...', 'amadeus': '...', 'apollo': '...', 'worldspan': '...'}. "
-        "Only set 'found' to false if the property absolutely cannot be identified."
+        f"Search for GDS codes for: '{hotel_name}'. "
+        "Return ONLY this exact JSON format, no extra text: "
+        '{"found": true, "chain": "PW", "sabre": "123", "amadeus": "123", "apollo": "123", "worldspan": "123"}'
     )
+    
     try:
         response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
-        return json.loads(response.text.strip().replace('```json', '').replace('```', ''))
+        # CLEANER: Removes markdown code blocks if the AI includes them
+        raw_text = response.text.strip().replace('```json', '').replace('```', '')
+        return json.loads(raw_text)
     except Exception as e:
-        print(f"⚠️ AI Step skipped (Rate Limit/Error): {e}")
+        print(f"⚠️ AI Step failed: {e}")
         return {"found": False}
 
-async def handle_selection_page(page, target_name):
-    """Specifically targets the list link seen in your results screenshot."""
-    print(f"📋 Selection page detected. Forcing click on property link...")
-    try:
-        # This targets the <a> tag inside the first <li> under the 'Hotels' <h3>
-        hotel_link = page.locator("h3:has-text('Hotels') + ul li a").first
-        await hotel_link.scroll_into_view_if_needed()
-        # Force click is mandatory due to remaining hidden overlays
-        await hotel_link.click(force=True)
-        print(f"✅ Property clicked successfully.")
-        return True
-    except: return False
-
 async def conduct_web_research(hotel_name):
+    """Backup: Hits TravelWeekly and forces a click on the correct property link."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         try:
-            print(f"🔎 Searching Travel Weekly for: {hotel_name}")
-            await page.goto("https://www.travelweekly.com/Hotels", wait_until="domcontentloaded")
+            print(f"🔎 AI failed. Searching Travel Weekly for: {hotel_name}")
+            await page.goto("https://www.travelweekly.com/Hotels", wait_until="networkidle")
             
-            # Delete the dark filter overlay that blocks clicks
-            await page.evaluate("document.querySelectorAll('.onetrust-pc-dark-filter, #onetrust-consent-sdk').forEach(el => el.remove())")
+            # Kill the dark filter that causes timeouts (image_b02403.png)
+            await page.evaluate("document.querySelectorAll('.onetrust-pc-dark-filter').forEach(el => el.remove())")
             
+            # Fill search
             await page.locator("input[placeholder*='name or destination']").first.fill(hotel_name)
-            await page.locator("button:has-text('Search Hotels')").first.click(force=True)
+            await page.locator("button:has-text('Search Hotels')").first.click()
             await page.wait_for_timeout(5000)
 
-            # HANDLE THE SELECTION PAGE
+            # FORCE CLICK the property in the 'Hotels' list (image_a52f1d.png)
             if await page.get_by_text("Hotel Search Selection").is_visible():
-                await handle_selection_page(page, hotel_name)
+                print("📋 Selection page detected. Forcing click...")
+                # Specifically targets the list under the 'Hotels' header
+                await page.locator("h3:has-text('Hotels') + ul li a").first.click(force=True)
                 await page.wait_for_timeout(3000)
 
-            # Click Details for the final table
+            # Final 'View Details' to reach the GDS table
             details = page.get_by_text("View Hotel Details").first
             if await details.is_visible():
                 await details.click(force=True)
                 await page.wait_for_load_state("networkidle")
 
-            await page.screenshot(path=f"screenshots/{hotel_name}_Final_GDS.png", full_page=True)
+            await page.screenshot(path=f"screenshots/{hotel_name.replace(' ', '_')}_Final.png", full_page=True)
+            print(f"✅ GDS captured for {hotel_name}")
         finally:
             await browser.close()
 
 async def main():
     os.makedirs("screenshots", exist_ok=True)
-    # Extract hotel names (Simplified for this example)
-    hotel_list = [{"name": "The Reeds at Shelter Haven"}] 
+    # Using a list based on your email input
+    hotel_list = [{"name": EMAIL_BODY}] 
     
     for hotel in hotel_list:
         name = hotel['name']
-        gds_data = await ask_gemini_for_gds(name)
+        print(f"--- Starting: {name} ---")
         
-        if gds_data.get('found'):
-            chain = gds_data['chain']
-            report = f"PROPERTY: {name}\nCHAIN: {chain}\nSABRE: {chain}{gds_data['sabre']}\nAMADEUS: {chain}{gds_data['amadeus']}"
-            with open(f"screenshots/{name}_GDS.txt", "w") as f: f.write(report)
-            print(f"✨ AI Found Data for {name}")
+        data = await ask_gemini_for_gds(name)
+        
+        if data.get('found') and data.get('chain'):
+            # Formats the clean table you wanted with the 2-letter code (e.g. PW)
+            c = data['chain']
+            report = f"PROPERTY: {name}\nCHAIN: {c}\nSABRE: {c}{data['sabre']}\nAMADEUS: {c}{data['amadeus']}"
+            with open(f"screenshots/{name.replace(' ', '_')}_GDS.txt", "w") as f:
+                f.write(report)
+            print(f"✨ SUCCESS: AI found {c} codes.")
         else:
             await conduct_web_research(name)
         
-        # MANDATORY COOLDOWN between hotels to prevent 429 error
-        await asyncio.sleep(10) 
+        await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())
