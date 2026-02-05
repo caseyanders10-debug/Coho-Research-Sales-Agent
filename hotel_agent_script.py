@@ -4,12 +4,12 @@ import json
 from google import genai
 from playwright.async_api import async_playwright
 
-# SETUP: New 2026 Client logic
+# SETUP: Using the updated 2026 Client logic
 EMAIL_BODY = os.environ.get("EMAIL_INPUT", "No email provided")
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 async def get_hotel_info_from_ai(text):
-    """Uses Gemini 2.0 to extract hotel info using the new stateless function."""
+    """Uses Gemini 2.0 to extract hotel info using the unified Client."""
     prompt = f"Extract the hotel name and official website URL from this text. Return ONLY a JSON list of objects: [{{'name': '...', 'url': '...'}}]. Text: {text}"
     try:
         # UPDATED: Using the new Client.models.generate_content method
@@ -23,7 +23,7 @@ async def get_hotel_info_from_ai(text):
 async def conduct_research(hotel):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        # 2026 Stealth User Agent
+        # Stealth User Agent to appear more human
         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         page = await context.new_page()
         
@@ -41,18 +41,21 @@ async def conduct_research(hotel):
             print(f"🔎 Researching {name} on Travel Weekly...")
             await page.goto("https://www.travelweekly.com/hotels", wait_until="domcontentloaded")
             
-            # Select the search box and "type" like a human
+            # Select the search box and "type" character-by-character to trigger JS listeners
             search_box = page.locator("#hotelName, input[placeholder*='Hotel Name']").first
             await search_box.click()
-            await page.keyboard.type(name, delay=100) # Type with human-like delays
+            await page.keyboard.type(name, delay=100) 
             await page.keyboard.press("Enter")
             
-            # Wait for results to actually load
+            # Wait for search results to load
             await page.wait_for_timeout(5000)
             
-            # Look for GDS table or the "Details" link
-            if await page.get_by_text("View Hotel Details").first.is_visible():
-                await page.get_by_text("View Hotel Details").first.click()
+            # Look for the specific "View Hotel Details" link to find the codes
+            details_link = page.get_by_text("View Hotel Details").first
+            if await details_link.is_visible():
+                await details_link.click()
+                # Wait for the table containing Sabre (AA), Amadeus (1A), etc.
+                await page.wait_for_load_state("networkidle")
                 await page.wait_for_timeout(3000)
 
             await page.screenshot(path=f"screenshots/{name.replace(' ', '_')}_GDS_RESEARCH.png", full_page=True)
