@@ -1,20 +1,47 @@
 import asyncio
 import os
 import json
-from typing import Optional, Dict, Any
+import re
+from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse, urljoin
 
+import httpx
 from google import genai
 from playwright.async_api import async_playwright
 
-# Raw input from workflow: can be a full email body OR a short hotel name
 EMAIL_INPUT = os.environ.get("EMAIL_INPUT", "").strip()
-
-# Gemini client
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
+
+# Patterns commonly seen in booking-engine URLs / vendors
+BOOKING_HINT_PATTERNS = [
+    r"/book", r"/booking", r"/reservations", r"/reservation", r"/reserve", r"/availability",
+    r"synxis", r"sabre", r"travelclick", r"ihotelier", r"webrezpro", r"cloudbeds",
+    r"roomkey", r"stayntouch", r"opera", r"reservations\.", r"be\.", r"bookingengine", r"rez",
+]
+
+BOT_BLOCK_PATTERNS = [
+    "are you a human",
+    "verify you are human",
+    "verification required",
+    "captcha",
+    "access denied",
+    "unusual traffic",
+    "press and hold",
+    "cloudflare",
+    "checking your browser",
+]
+
+BOOKING_UI_SIGNALS = [
+    "check-in", "check in", "check-out", "check out",
+    "arrival", "departure",
+    "promo code", "rate", "rates",
+    "rooms", "guests",
+    "availability",
+    "book now", "reserve",
+]
 
 
 def _strip_code_fences(text: str) -> str:
-    """Remove common markdown code fences Gemini might add."""
     if not text:
         return ""
     return (
@@ -27,14 +54,10 @@ def _strip_code_fences(text: str) -> str:
 
 
 async def gemini_json(prompt: str, retries: int = 3, base_delay_s: int = 8) -> Optional[Dict[str, Any]]:
-    """Call Gemini and parse a JSON object from the response, with retries."""
     for attempt in range(1, retries + 1):
         try:
             print(f"🤖 Gemini request (attempt {attempt}/{retries})...")
-            resp = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt
-            )
+            resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
             raw = _strip_code_fences(getattr(resp, "text", "") or "")
             return json.loads(raw)
         except Exception as e:
@@ -44,11 +67,7 @@ async def gemini_json(prompt: str, retries: int = 3, base_delay_s: int = 8) -> O
 
 
 async def extract_hotel_name(raw_email_or_name: str) -> str:
-    """
-    If the input looks like a short name, return it.
-    If it looks like an email body, ask Gemini to extract the property name.
-    """
-    # If it's already short and single-line, assume it's a name.
+    # If it's short and single-line, treat it as a name.
     if raw_email_or_name and len(raw_email_or_name) <= 120 and "\n" not in raw_email_or_name:
         return raw_email_or_name.strip()
 
@@ -62,105 +81,148 @@ async def extract_hotel_name(raw_email_or_name: str) -> str:
         name = (data.get("hotel_name") or "").strip()
         if name:
             return name
-
-    # Fallback if extraction fails
     return "UNKNOWN_PROPERTY"
 
 
 async def lookup_property_details(hotel_name: str) -> Optional[Dict[str, Any]]:
-    """
-    Ask Gemini for GDS codes + phone + official site URL.
-    Keep this strictly structured to reduce hallucinations.
-    """
     prompt = (
-        f"Provide GDS codes, official phone, and official website URL for '{hotel_name}'.\n"
-        "Return ONLY JSON with keys exactly:\n"
-        "chain, sabre, amadeus, apollo, worldspan, phone, url\n"
+        f"Provide the official website URL for '{hotel_name}'.\n"
+        "Return ONLY JSON with keys exactly: phone, url\n"
         "Use null for unknown values.\n"
-        "Example:\n"
-        "{\"chain\":\"PW\",\"sabre\":\"192496\",\"amadeus\":\"WWDRSH\",\"apollo\":\"44708\","
-        "\"worldspan\":\"ACYRS\",\"phone\":\"609-368-0100\",\"url\":\"https://reedsatshelterhaven.com/\"}"
+        "Example: {\"phone\":\"609-368-0100\",\"url\":\"https://reedsatshelterhaven.com/\"}"
     )
     return await gemini_json(prompt)
 
 
 def looks_like_bot_block(html: str) -> bool:
-    """Basic detection for common verification / bot-check pages."""
     if not html:
         return False
     s = html.lower()
-    patterns = [
-        "are you a human",
-        "verify you are human",
-        "verification required",
-        "captcha",
-        "access denied",
-        "unusual traffic",
-        "press and hold",
-        "bot detection",
-        "cloudflare",
-        "checking your browser",
+    return any(p in s for p in BOT_BLOCK_PATTERNS)
+
+
+def looks_like_booking_ui(html: str) -> bool:
+    if not html:
+        return False
+    s = html.lower()
+    hits = sum(sig in s for sig in BOOKING_UI_SIGNALS)
+    return hits >= 2
+
+
+def normalize_url(u: str, base: Optional[str] = None) -> str:
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if base and not u.startswith(("http://", "https://")):
+        return urljoin(base, u)
+    if u.startswith("//"):
+        return "https:" + u
+    if not u.startswith(("http://", "https://")):
+        return "https://" + u
+    return u
+
+
+def likely_booking_url(url: str) -> bool:
+    s = (url or "").lower()
+    return any(re.search(p, s) for p in BOOKING_HINT_PATTERNS)
+
+
+async def fetch_html(url: str, timeout_s: float = 15.0) -> tuple[int, str]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+    }
+    async with httpx.AsyncClient(follow_redirects=True, headers=headers, timeout=timeout_s) as c:
+        r = await c.get(url)
+        return r.status_code, (r.text or "")[:200000]
+
+
+def common_booking_paths(official_url: str) -> List[str]:
+    parsed = urlparse(official_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    return [
+        base + "/book",
+        base + "/booking",
+        base + "/reservations",
+        base + "/reservation",
+        base + "/reserve",
+        base + "/availability",
     ]
-    return any(p in s for p in patterns)
 
 
-def write_report(path: str, hotel_name: str, data: Optional[Dict[str, Any]]) -> None:
-    """Always write a report so artifacts upload doesn't fail."""
+async def discover_booking_urls_with_gemini(hotel_name: str, official_url: str) -> List[str]:
+    prompt = (
+        "Find the DIRECT booking engine URL(s) for this hotel (the page where guests pick dates/rooms).\n"
+        "Return ONLY JSON: {\"booking_urls\": [\"https://...\", \"https://...\"]}.\n"
+        "Prefer direct vendor booking URLs (SynXis/iHotelier/TravelClick/Cloudbeds/WebRezPro/etc) "
+        "or a /book /reservations /availability page.\n\n"
+        f"HOTEL: {hotel_name}\n"
+        f"OFFICIAL SITE: {official_url}\n"
+    )
+    data = await gemini_json(prompt)
+    urls = []
     if data and isinstance(data, dict):
-        c = data.get("chain") or ""
-        report = (
-            f"--- GDS PROPERTY SNAPSHOT ---\n"
-            f"PROPERTY:  {hotel_name}\n"
-            f"PHONE:     {data.get('phone')}\n"
-            f"URL:       {data.get('url')}\n"
-            f"CHAIN:     {c}\n"
-            f"-----------------------------\n"
-            f"SABRE:     {c}{data.get('sabre')}\n"
-            f"AMADEUS:   {c}{data.get('amadeus')}\n"
-            f"APOLLO:    {c}{data.get('apollo')}\n"
-            f"WORLDSPAN: {c}{data.get('worldspan')}\n"
-            f"-----------------------------\n"
-        )
-    else:
-        report = f"Failed to retrieve data for {hotel_name}\n"
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(report)
-    print(f"✅ Report saved: {path}")
+        urls = data.get("booking_urls") or []
+    # Normalize & de-dupe
+    out = []
+    seen = set()
+    for u in urls:
+        nu = normalize_url(u, base=official_url)
+        if nu and nu not in seen:
+            seen.add(nu)
+            out.append(nu)
+    return out
 
 
-async def capture_site_proof(url: str) -> None:
+async def choose_accessible_booking_url(candidates: List[str]) -> str:
     """
-    Visit the official URL directly. If blocked, save BLOCKED.png + BLOCKED.html.
-    Otherwise save a normal proof screenshot.
+    Pick the first candidate that:
+    - returns 2xx/3xx
+    - is NOT a bot-verification page
+    - looks like a booking UI (or URL strongly suggests booking)
     """
-    print(f"🌐 Visiting: {url}")
+    for url in candidates:
+        try:
+            status, html = await fetch_html(url)
+            if status >= 400:
+                continue
+            if looks_like_bot_block(html):
+                continue
+            if looks_like_booking_ui(html) or likely_booking_url(url):
+                return url
+        except Exception:
+            continue
+    return ""
 
+
+async def screenshot_booking_engine(url: str) -> None:
+    """
+    This is the actual goal: open the booking engine page and screenshot the booking UI.
+    """
+    print(f"🧾 Opening booking engine: {url}")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
-
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(2)
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            await asyncio.sleep(3)
 
             html = await page.content()
             if looks_like_bot_block(html):
-                print("🧱 Bot/verification page detected. Capturing evidence and continuing.")
-                await page.screenshot(path="screenshots/BLOCKED.png", full_page=True)
-                with open("screenshots/BLOCKED.html", "w", encoding="utf-8") as f:
+                print("🧱 Booking engine is protected (verification page). Capturing evidence.")
+                await page.screenshot(path="screenshots/BOOKING_BLOCKED.png", full_page=True)
+                with open("screenshots/BOOKING_BLOCKED.html", "w", encoding="utf-8") as f:
                     f.write(html)
             else:
-                await page.screenshot(path="screenshots/Booking_Engine_Proof.png", full_page=False)
-                print("📸 Booking proof captured.")
+                # Full page screenshot of the booking engine UI
+                await page.screenshot(path="screenshots/BOOKING_ENGINE.png", full_page=True)
+                print("📸 Saved: screenshots/BOOKING_ENGINE.png")
 
         except Exception as e:
-            print(f"⚠️ Direct visit failed: {e}")
+            print(f"⚠️ Booking engine visit failed: {e}")
             try:
-                await page.screenshot(path="screenshots/visit_error.png", full_page=True)
+                await page.screenshot(path="screenshots/BOOKING_VISIT_ERROR.png", full_page=True)
             except Exception:
                 pass
-
         finally:
             await browser.close()
 
@@ -169,30 +231,51 @@ async def main():
     os.makedirs("screenshots", exist_ok=True)
 
     if not os.environ.get("GEMINI_API_KEY"):
-        print("❌ GEMINI_API_KEY is missing. Add it to GitHub Secrets and workflow env.")
-        # Still create a report so artifacts exist
-        write_report("screenshots/GDS_REPORT.txt", "UNKNOWN_PROPERTY", None)
+        print("❌ GEMINI_API_KEY is missing. Add it to GitHub Secrets.")
+        with open("screenshots/GDS_REPORT.txt", "w", encoding="utf-8") as f:
+            f.write("Missing GEMINI_API_KEY\n")
         return
 
-    # 1) Extract hotel name from email (or accept short name)
     hotel_name = await extract_hotel_name(EMAIL_INPUT)
-    print(f"🏨 Property name: {hotel_name}")
+    print(f"Property name: {hotel_name}")
 
-    # 2) Lookup details
-    data = await lookup_property_details(hotel_name)
+    details = await lookup_property_details(hotel_name)
+    official_url = (details or {}).get("url") or ""
+    official_url = official_url.strip()
 
-    # 3) Always write report
-    write_report("screenshots/GDS_REPORT.txt", hotel_name, data)
+    # Always write something so your artifact step always has files
+    with open("screenshots/GDS_REPORT.txt", "w", encoding="utf-8") as f:
+        f.write(json.dumps({"hotel": hotel_name, "official_url": official_url, "phone": (details or {}).get("phone")}, indent=2))
+    print("Report saved: screenshots/GDS_REPORT.txt")
 
-    # 4) Visit official URL (best effort)
-    url = None
-    if data and isinstance(data, dict):
-        url = (data.get("url") or "").strip()
+    if not official_url:
+        print("❌ No official URL found; cannot discover booking engine.")
+        return
 
-    if url:
-        await capture_site_proof(url)
+    # 1) Ask AI for booking engine URLs
+    ai_candidates = await discover_booking_urls_with_gemini(hotel_name, official_url)
+
+    # 2) Add common paths on same domain
+    path_candidates = common_booking_paths(official_url)
+
+    # Combine (AI first)
+    candidates = []
+    for u in ai_candidates + path_candidates:
+        if u and u not in candidates:
+            candidates.append(u)
+
+    # Save candidates for debugging
+    with open("screenshots/BOOKING_CANDIDATES.json", "w", encoding="utf-8") as f:
+        json.dump({"hotel": hotel_name, "official_url": official_url, "candidates": candidates}, f, indent=2)
+
+    booking_url = await choose_accessible_booking_url(candidates)
+
+    if booking_url:
+        await screenshot_booking_engine(booking_url)
     else:
-        print("ℹ️ No URL returned from Gemini; skipping website visit.")
+        print("❌ No accessible booking engine URL found (without verification pages).")
+        # Optional: try official URL anyway just to capture what block looks like there
+        await screenshot_booking_engine(official_url)
 
 
 if __name__ == "__main__":
