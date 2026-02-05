@@ -33,6 +33,17 @@ jobs:
         run: mkdir -p screenshots
 
       - name: Run Agent
+      - name: Debug - list workspace and screenshots
+        if: always()
+        run: |
+          echo "PWD: $(pwd)"
+          echo "Repo files:"
+          ls -la
+          echo "Screenshots dir:"
+          ls -la screenshots || true
+          echo "Find any png/json/txt:"
+          find . -maxdepth 3 -type f \( -name "*.png" -o -name "*.json" -o -name "*.txt" -o -name "*.html" \) -print
+
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           EMAIL_INPUT: ${{ github.event.inputs.email_body }}
