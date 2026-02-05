@@ -1,4 +1,5 @@
 playwright
 google-genai
-tenacity
 httpx
+beautifulsoup4
+
