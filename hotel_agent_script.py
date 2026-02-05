@@ -11,26 +11,28 @@ from google import genai
 from playwright.async_api import async_playwright
 
 # ======================================================================
-# Hotel Agent Script (CI-safe, always writes artifacts)
-# - Extracts hotel name (if EMAIL_INPUT is full email)
-# - Gets official URL (Gemini)
-# - GDS lookup: Gemini guess -> TravelWeekly deterministic override
-# - Booking engine: Gemini candidate URLs + common paths -> open + screenshot
-# - Captures BLOCKED evidence instead of hanging on verification pages
+# HOTEL AGENT SCRIPT (CI-safe, always writes artifacts)
 #
-# REQUIRED env:
-#   GEMINI_API_KEY
-#   EMAIL_INPUT   (hotel name OR raw email body)
+# What it does:
+# - Always creates screenshots/RUN_STATUS.txt immediately (artifact always exists)
+# - Extracts hotel name from EMAIL_INPUT (hotel name OR raw email body)
+# - GDS lookup: Gemini guess -> TravelWeekly deterministic override (if found)
+# - Booking engine: Gemini URL candidates + common paths -> open + screenshot
+# - If a page is blocked by "verify you are human", it saves BLOCKED evidence
 #
-# REQUIRED requirements.txt:
+# Environment variables required:
+#   GEMINI_API_KEY   (GitHub Secret)
+#   EMAIL_INPUT      (workflow input)
+#
+# requirements.txt must include:
 #   playwright
 #   google-genai
 #   httpx
 #   beautifulsoup4
 # ======================================================================
 
-# Always print something at import-time so you can confirm the right script is running
-print("🔥 HOTEL AGENT VERSION: 2026-02-05 🔥")
+VERSION = "2026-02-05.2"
+print(f"🔥 HOTEL AGENT VERSION: {VERSION} 🔥")
 
 EMAIL_INPUT = os.environ.get("EMAIL_INPUT", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -38,10 +40,22 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 ART_DIR = "screenshots"
 os.makedirs(ART_DIR, exist_ok=True)
 
-# Create a guaranteed file immediately so artifacts always exist
-with open(os.path.join(ART_DIR, "RUN_STATUS.txt"), "w", encoding="utf-8") as f:
+# Create a guaranteed artifact immediately (even if everything else fails)
+RUN_STATUS_PATH = os.path.join(ART_DIR, "RUN_STATUS.txt")
+with open(RUN_STATUS_PATH, "w", encoding="utf-8") as f:
     f.write("starting\n")
 
+def write_text(filename: str, content: str) -> None:
+    path = os.path.join(ART_DIR, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+def write_json(filename: str, obj: Any) -> None:
+    path = os.path.join(ART_DIR, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+
+# Gemini client (optional if key missing)
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 BOT_BLOCK_PATTERNS = [
@@ -70,20 +84,6 @@ BOOKING_UI_SIGNALS = [
     "availability",
     "book now", "reserve",
 ]
-
-
-# ----------------------------
-# Utility helpers
-# ----------------------------
-def write_text(name: str, content: str) -> None:
-    path = os.path.join(ART_DIR, name)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-def write_json(name: str, obj: Any) -> None:
-    path = os.path.join(ART_DIR, name)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2)
 
 def _strip_code_fences(text: str) -> str:
     if not text:
@@ -125,10 +125,6 @@ def normalize_url(u: str, base: Optional[str] = None) -> str:
         return "https://" + u
     return u
 
-
-# ----------------------------
-# HTTP fetch
-# ----------------------------
 async def fetch(url: str, timeout_s: float = 20.0) -> Tuple[int, str]:
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
@@ -138,15 +134,10 @@ async def fetch(url: str, timeout_s: float = 20.0) -> Tuple[int, str]:
         r = await c.get(url)
         return r.status_code, (r.text or "")
 
-
 # ----------------------------
 # Gemini helpers
 # ----------------------------
 async def gemini_json(prompt: str, retries: int = 3, base_delay_s: int = 12) -> Optional[Dict[str, Any]]:
-    """
-    Gemini call that returns a JSON object, with retry/backoff.
-    Handles occasional 429 RESOURCE_EXHAUSTED.
-    """
     if not client:
         return None
 
@@ -161,9 +152,7 @@ async def gemini_json(prompt: str, retries: int = 3, base_delay_s: int = 12) -> 
             await asyncio.sleep(base_delay_s * attempt)
     return None
 
-
 async def extract_hotel_name(raw_email_or_name: str) -> str:
-    # If it's already short and single-line, treat it as hotel name.
     if raw_email_or_name and len(raw_email_or_name) <= 140 and "\n" not in raw_email_or_name:
         return raw_email_or_name.strip()
 
@@ -182,7 +171,6 @@ async def extract_hotel_name(raw_email_or_name: str) -> str:
             return name
     return "UNKNOWN_PROPERTY"
 
-
 async def gemini_official_url(hotel_name: str) -> Optional[str]:
     if not client:
         return None
@@ -195,7 +183,6 @@ async def gemini_official_url(hotel_name: str) -> Optional[str]:
         url = (data.get("url") or "").strip()
         return url or None
     return None
-
 
 async def gemini_gds_guess(hotel_name: str) -> Optional[Dict[str, Any]]:
     if not client:
@@ -212,7 +199,6 @@ async def gemini_gds_guess(hotel_name: str) -> Optional[Dict[str, Any]]:
     if data and isinstance(data, dict):
         return data
     return None
-
 
 async def gemini_booking_urls(hotel_name: str, official_url: str) -> List[str]:
     if not client:
@@ -237,33 +223,32 @@ async def gemini_booking_urls(hotel_name: str, official_url: str) -> List[str]:
             out.append(nu)
     return out
 
-
 # ----------------------------
 # Travel Weekly fallback (deterministic)
 # ----------------------------
 def _parse_gds_from_travelweekly_html(html: str) -> Optional[Dict[str, Any]]:
     if not html:
         return None
+
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
 
-    def grab(label: str) -> Optional[str]:
+    def grab_code(label: str) -> Optional[str]:
         idx = text.find(label)
         if idx == -1:
             return None
         tail = text[idx + len(label):].lstrip()
 
-        # Try patterns with chain prefix: "PW 192496"
+        # Try "PW 192496" style
         m = re.match(r"([A-Z]{2,3})\s+([A-Z0-9]{3,12})", tail)
         if m:
             return m.group(2).strip()
 
-        # Or direct token: "192496" / "WWDRSH"
+        # Try just a token
         m2 = re.match(r"([A-Z0-9]{3,12})", tail, re.IGNORECASE)
         return m2.group(1).strip() if m2 else None
 
     chain = None
-    # Try to infer chain code from any of the lines
     for label in ["Sabre:", "Amadeus:", "Galileo/Apollo:", "Worldspan:"]:
         idx = text.find(label)
         if idx != -1:
@@ -275,10 +260,10 @@ def _parse_gds_from_travelweekly_html(html: str) -> Optional[Dict[str, Any]]:
 
     out = {
         "chain": chain,
-        "sabre": grab("Sabre:"),
-        "amadeus": grab("Amadeus:"),
-        "apollo": grab("Galileo/Apollo:") or grab("Apollo:"),
-        "worldspan": grab("Worldspan:"),
+        "sabre": grab_code("Sabre:"),
+        "amadeus": grab_code("Amadeus:"),
+        "apollo": grab_code("Galileo/Apollo:") or grab_code("Apollo:"),
+        "worldspan": grab_code("Worldspan:"),
         "source": "travelweekly",
         "verified": True,
     }
@@ -287,17 +272,14 @@ def _parse_gds_from_travelweekly_html(html: str) -> Optional[Dict[str, Any]]:
         return out
     return None
 
-
 async def travelweekly_find_hotel_page_url(hotel_name: str) -> Optional[str]:
     q = quote_plus(hotel_name)
     search_url = f"https://www.travelweekly.com/Search?q={q}"
-
     status, html = await fetch(search_url, timeout_s=25.0)
     if status >= 400 or not html:
         return None
 
     soup = BeautifulSoup(html, "html.parser")
-
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -305,7 +287,6 @@ async def travelweekly_find_hotel_page_url(hotel_name: str) -> Optional[str]:
             full = normalize_url(href, base="https://www.travelweekly.com")
             links.append(full)
 
-    # De-dupe
     seen = set()
     dedup = []
     for u in links:
@@ -314,7 +295,6 @@ async def travelweekly_find_hotel_page_url(hotel_name: str) -> Optional[str]:
             dedup.append(u)
 
     return dedup[0] if dedup else None
-
 
 async def lookup_gds_from_travelweekly(hotel_name: str) -> Optional[Dict[str, Any]]:
     tw_url = await travelweekly_find_hotel_page_url(hotel_name)
@@ -331,7 +311,6 @@ async def lookup_gds_from_travelweekly(hotel_name: str) -> Optional[Dict[str, An
         return data
     return None
 
-
 # ----------------------------
 # Booking engine helpers
 # ----------------------------
@@ -347,7 +326,6 @@ def common_booking_paths(official_url: str) -> List[str]:
         base + "/availability",
     ]
 
-
 async def choose_accessible_booking_url(candidates: List[str]) -> str:
     for url in candidates:
         try:
@@ -361,7 +339,6 @@ async def choose_accessible_booking_url(candidates: List[str]) -> str:
         except Exception:
             continue
     return ""
-
 
 async def screenshot_page(url: str, ok_png: str, blocked_png: str, blocked_html: str) -> None:
     print(f"🌐 Opening: {url}")
@@ -390,18 +367,18 @@ async def screenshot_page(url: str, ok_png: str, blocked_png: str, blocked_html:
         finally:
             await browser.close()
 
-
 # ----------------------------
-# Main
+# MAIN
 # ----------------------------
 async def main() -> None:
+    print("✅ ENTERED main()")
+
     if not EMAIL_INPUT:
         write_text("RUN_STATUS.txt", "EMAIL_INPUT missing\n")
         print("❌ EMAIL_INPUT missing.")
         return
 
     if not GEMINI_API_KEY:
-        # We can still attempt TravelWeekly GDS (deterministic), but booking discovery will be limited.
         print("⚠️ GEMINI_API_KEY missing. Gemini steps will be skipped.")
         write_text("RUN_STATUS.txt", "GEMINI_API_KEY missing; continuing with TravelWeekly only\n")
 
@@ -451,6 +428,47 @@ async def main() -> None:
 
     # De-dupe candidates
     dedup: List[str] = []
-    seen = set
+    seen = set()
+    for u in candidates:
+        nu = normalize_url(u, base=official_url if official_url else None)
+        if nu and nu not in seen:
+            seen.add(nu)
+            dedup.append(nu)
+
+    write_json("BOOKING_CANDIDATES.json", {"hotel": hotel_name, "official_url": official_url, "candidates": dedup})
+
+    booking_url = await choose_accessible_booking_url(dedup) if dedup else ""
+
+    if booking_url:
+        write_text("RUN_STATUS.txt", f"booking_url={booking_url}\n")
+        await screenshot_page(
+            booking_url,
+            ok_png="BOOKING_ENGINE.png",
+            blocked_png="BOOKING_BLOCKED.png",
+            blocked_html="BOOKING_BLOCKED.html",
+        )
+    else:
+        write_text("RUN_STATUS.txt", "no_accessible_booking_engine\n")
+        print("❌ No accessible booking engine URL found (without verification pages).")
+        # Capture what happens on official URL for evidence
+        if official_url:
+            await screenshot_page(
+                official_url,
+                ok_png="OFFICIAL_SITE.png",
+                blocked_png="OFFICIAL_BLOCKED.png",
+                blocked_html="OFFICIAL_BLOCKED.html",
+            )
+
+if __name__ == "__main__":
+    print("✅ ENTERED __main__")
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        # Guarantee an artifact even on crash
+        os.makedirs(ART_DIR, exist_ok=True)
+        with open(os.path.join(ART_DIR, "CRASH.txt"), "w", encoding="utf-8") as f:
+            f.write(f"Script crashed:\n{repr(e)}\n")
+        raise
+
 
 
