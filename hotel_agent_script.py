@@ -9,65 +9,96 @@ HOTEL_NAME = os.environ.get("EMAIL_INPUT", "The Reeds at Shelter Haven")
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 async def ask_gemini_for_gds(name):
-    """AI Step: Retries 429s and returns clean JSON."""
+    """AI Step: Fast track for GDS codes."""
     prompt = (f"Provide ACTUAL GDS codes for '{name}'. Return ONLY JSON: "
               "{'found': true, 'chain': 'PW', 'sabre': '192496', 'amadeus': 'WWDRSH', 'apollo': '44708', 'worldspan': 'ACYRS'}")
     try:
         response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
         clean_json = response.text.strip().replace('```json', '').replace('```', '')
         return json.loads(clean_json)
-    except Exception as e:
-        print(f"❌ AI Error: {e}")
-        return {"found": False}
+    except:
+        return None
 
-async def conduct_web_research(name):
-    """Web Step: Forces a screenshot of the TravelWeekly results."""
+async def find_booking_engine(name):
+    """Web Step: Accepts cookies and hunts for the booking button."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        # Use a real browser window size to ensure buttons aren't hidden in mobile menus
+        context = await browser.new_context(viewport={'width': 1920, 'height': 1080})
+        page = await context.new_page()
+        
         try:
-            print(f"🌐 Capturing web proof for {name}...")
-            await page.goto("https://www.travelweekly.com/Hotels", wait_until="domcontentloaded")
-            # Remove cookie banners
-            await page.evaluate("document.querySelectorAll('.onetrust-pc-dark-filter, #onetrust-consent-sdk').forEach(el => el.remove())")
+            print(f"🌐 Searching for {name} official website...")
+            # We'll use Google to find the official site first
+            search_url = f"https://www.google.com/search?q={name.replace(' ', '+')}+official+site"
+            await page.goto(search_url, wait_until="networkidle")
             
-            await page.locator("input[placeholder*='name or destination']").first.fill(name)
-            await page.locator("button:has-text('Search Hotels')").first.click(force=True)
-            await asyncio.sleep(5)
+            # Click the first organic search result
+            await page.locator("h3").first.click()
+            await page.wait_for_load_state("networkidle")
+            print(f"🔗 Arrived at: {page.url}")
+
+            # --- STEP 1: ACCEPT COOKIES ---
+            # We look for common 'Accept' buttons
+            cookie_selectors = [
+                "text=Accept All", "text=Accept Cookies", "text=Agree", 
+                "button:has-text('Accept')", "#onetrust-accept-btn-handler"
+            ]
+            for selector in cookie_selectors:
+                try:
+                    button = page.locator(selector).first
+                    if await button.is_visible(timeout=3000):
+                        await button.click()
+                        print("🍪 Cookies Accepted.")
+                        break
+                except: continue
+
+            # --- STEP 2: FIND BOOKING ENGINE ---
+            # We look for the main call-to-action button
+            booking_selectors = [
+                "text=Book Now", "text=Reservations", "text=Check Availability", 
+                "text=Book Your Stay", ".booking-button", "a[href*='booking']"
+            ]
             
-            # Take screenshot of the results page for the artifact
-            await page.screenshot(path=f"screenshots/{name.replace(' ', '_')}_Web_Results.png")
-            print(f"📸 Web screenshot saved.")
+            found_booking = False
+            for selector in booking_selectors:
+                try:
+                    btn = page.locator(selector).first
+                    if await btn.is_visible(timeout=3000):
+                        print(f"🎯 Booking Engine found: {selector}")
+                        # Take a screenshot highlighting the button
+                        await btn.screenshot(path=f"screenshots/{name.replace(' ', '_')}_Booking_Button.png")
+                        # Click it to see where it leads
+                        await btn.click()
+                        await page.wait_for_load_state("networkidle")
+                        await page.screenshot(path=f"screenshots/{name.replace(' ', '_')}_Booking_Engine.png", full_page=True)
+                        found_booking = True
+                        break
+                except: continue
+
+            if not found_booking:
+                print("⚠️ Could not find a clear booking button. Taking general screenshot.")
+                await page.screenshot(path=f"screenshots/{name.replace(' ', '_')}_Home_Page.png", full_page=True)
+
         except Exception as e:
-            print(f"⚠️ Web screenshot failed: {e}")
+            print(f"❌ Web Research Error: {e}")
         finally:
             await browser.close()
 
 async def main():
-    # Ensure the directory exists so GitHub Actions doesn't fail
     os.makedirs("screenshots", exist_ok=True)
     
-    # 1. Get AI Data
-    print(f"🤖 Starting AI lookup for: {HOTEL_NAME}")
+    # 1. Get GDS data via AI (Fastest way to get PW codes)
     gds_data = await ask_gemini_for_gds(HOTEL_NAME)
-    
-    # 2. Always create a text file artifact if data is found
-    if gds_data.get('found'):
+    if gds_data:
         c = gds_data['chain']
-        report = (f"PROPERTY: {HOTEL_NAME}\n"
-                  f"CHAIN: {c}\n"
-                  f"SABRE: {c}{gds_data['sabre']}\n"
-                  f"AMADEUS: {c}{gds_data['amadeus']}\n"
-                  f"APOLLO: {c}{gds_data['apollo']}")
-        
-        # This creates the file GitHub is looking for
-        file_path = f"screenshots/{HOTEL_NAME.replace(' ', '_')}_GDS_Report.txt"
-        with open(file_path, "w") as f:
+        report = f"PROPERTY: {HOTEL_NAME}\nCHAIN: {c}\nSABRE: {c}{gds_data['sabre']}\nAMADEUS: {c}{gds_data['amadeus']}"
+        with open(f"screenshots/{HOTEL_NAME.replace(' ', '_')}_GDS_Report.txt", "w") as f:
             f.write(report)
-        print(f"✨ SUCCESS: Report written to {file_path}")
-    
-    # 3. Force a web screenshot for your booking engine requirement
-    await conduct_web_research(HOTEL_NAME)
+        print("✨ GDS Data Saved.")
+
+    # 2. Always run the Booking Engine hunt
+    await find_booking_engine(HOTEL_NAME)
 
 if __name__ == "__main__":
     asyncio.run(main())
