@@ -3,7 +3,7 @@ import os
 import json
 import re
 from typing import Optional, Dict, Any, List, Tuple
-from urllib.parse import urljoin, quote_plus
+from urllib.parse import urljoin, urlparse, quote_plus
 
 import httpx
 from bs4 import BeautifulSoup
@@ -11,30 +11,27 @@ from google import genai
 from playwright.async_api import async_playwright
 
 # ==========================================================
-# GOAL (per your requirements):
-# 1) Output ONLY the CHAIN CODE you care about (CHAIN_CODE.txt)
-# 2) Navigate to the BOOKING ENGINE and screenshot the booking UI
-#    (BOOKING_ENGINE.png), OR record proof it's protected.
+# GOALS:
+# 1) Chain code -> CHAIN_CODE.txt
+# 2) Booking engine screenshot -> BOOKING_ENGINE.png
+#    If blocked, capture evidence per candidate and keep trying.
 #
-# Design:
-# - Prefer TravelWeekly as authoritative directory
-# - Use Gemini ONLY to locate the TravelWeekly page URL
-# - Extract chain code deterministically from TravelWeekly HTML
-# - Extract booking engine candidates from TravelWeekly outbound links
-# - Only then try Gemini booking candidates/common paths
+# This version DOES NOT rely on search engines.
+# It tries multiple sources for booking URLs and then actually
+# opens candidates in Playwright until it finds the booking UI.
 #
 # Required env:
 #   GEMINI_API_KEY
-#   EMAIL_INPUT  (hotel name OR raw email body)
+#   EMAIL_INPUT
 #
-# Required requirements.txt:
+# requirements.txt:
 #   playwright
 #   google-genai
 #   httpx
 #   beautifulsoup4
 # ==========================================================
 
-VERSION = "2026-02-05.3"
+VERSION = "2026-02-05.4"
 print(f"🔥 HOTEL AGENT VERSION: {VERSION} 🔥")
 
 EMAIL_INPUT = os.environ.get("EMAIL_INPUT", "").strip()
@@ -51,7 +48,7 @@ def write_json(filename: str, obj: Any) -> None:
     with open(os.path.join(ART_DIR, filename), "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2)
 
-# Always create an artifact immediately
+# Always create at least one artifact immediately
 write_text("RUN_STATUS.txt", "starting\n")
 
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -68,14 +65,13 @@ BOT_BLOCK_PATTERNS = [
     "checking your browser",
 ]
 
-# “Likely booking engine” patterns — vendor + common paths
 BOOKING_HINT_PATTERNS = [
     r"/book", r"/booking", r"/reservations", r"/reservation", r"/reserve", r"/availability",
+    r"/book-now", r"/booknow", r"/rooms", r"/rates",
     r"synxis", r"sabre", r"travelclick", r"ihotelier", r"webrezpro", r"cloudbeds",
     r"roomkey", r"stayntouch", r"opera", r"reservations\.", r"be\.", r"bookingengine", r"rez",
 ]
 
-# Booking UI signals
 BOOKING_UI_SIGNALS = [
     "check-in", "check in", "check-out", "check out",
     "arrival", "departure",
@@ -84,23 +80,6 @@ BOOKING_UI_SIGNALS = [
     "availability",
     "book now", "reserve",
 ]
-
-def looks_like_bot_block(html: str) -> bool:
-    if not html:
-        return False
-    s = html.lower()
-    return any(p in s for p in BOT_BLOCK_PATTERNS)
-
-def likely_booking_url(url: str) -> bool:
-    s = (url or "").lower()
-    return any(re.search(p, s) for p in BOOKING_HINT_PATTERNS)
-
-def looks_like_booking_ui(html: str) -> bool:
-    if not html:
-        return False
-    s = html.lower()
-    hits = sum(sig in s for sig in BOOKING_UI_SIGNALS)
-    return hits >= 2
 
 def strip_code_fences(text: str) -> str:
     if not text:
@@ -113,6 +92,35 @@ def strip_code_fences(text: str) -> str:
         .strip()
     )
 
+def looks_like_bot_block(html: str) -> bool:
+    if not html:
+        return False
+    s = html.lower()
+    return any(p in s for p in BOT_BLOCK_PATTERNS)
+
+def looks_like_booking_ui(html: str) -> bool:
+    if not html:
+        return False
+    s = html.lower()
+    hits = sum(sig in s for sig in BOOKING_UI_SIGNALS)
+    return hits >= 2
+
+def likely_booking_url(url: str) -> bool:
+    s = (url or "").lower()
+    return any(re.search(p, s) for p in BOOKING_HINT_PATTERNS)
+
+def normalize_url(u: str, base: Optional[str] = None) -> str:
+    u = (u or "").strip()
+    if not u:
+        return ""
+    if base and u.startswith("/"):
+        return urljoin(base, u)
+    if u.startswith("//"):
+        return "https:" + u
+    if not u.startswith(("http://", "https://")):
+        return "https://" + u
+    return u
+
 async def fetch(url: str, timeout_s: float = 25.0) -> Tuple[int, str]:
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
@@ -123,7 +131,7 @@ async def fetch(url: str, timeout_s: float = 25.0) -> Tuple[int, str]:
         return r.status_code, (r.text or "")
 
 # ----------------------------
-# Gemini helpers (URL discovery only)
+# Gemini helpers
 # ----------------------------
 async def gemini_json(prompt: str, retries: int = 3, base_delay_s: int = 12) -> Optional[Dict[str, Any]]:
     if not client:
@@ -140,7 +148,6 @@ async def gemini_json(prompt: str, retries: int = 3, base_delay_s: int = 12) -> 
     return None
 
 async def extract_hotel_name(raw_email_or_name: str) -> str:
-    # If already a clean name, don’t waste tokens
     if raw_email_or_name and len(raw_email_or_name) <= 140 and "\n" not in raw_email_or_name:
         return raw_email_or_name.strip()
 
@@ -156,159 +163,170 @@ async def extract_hotel_name(raw_email_or_name: str) -> str:
     name = (data or {}).get("hotel_name") if isinstance(data, dict) else None
     return (name or "UNKNOWN_PROPERTY").strip()
 
-async def gemini_find_travelweekly_url(hotel_name: str) -> Optional[str]:
-    """
-    We use Gemini ONLY to locate the TravelWeekly hotel detail page URL.
-    This avoids needing search engines (CAPTCHA), and TW is usually crawlable.
-    """
+async def gemini_official_url(hotel_name: str) -> Optional[str]:
     if not client:
         return None
     prompt = (
-        "Find the TravelWeekly Hotels detail page URL for this hotel.\n"
-        "Return ONLY JSON: {\"travelweekly_url\": \"https://www.travelweekly.com/Hotels/...\"}.\n"
-        "If unsure, return {\"travelweekly_url\": null}.\n\n"
-        f"HOTEL: {hotel_name}\n"
+        f"Provide the official website URL for '{hotel_name}'. "
+        "Return ONLY JSON: {\"url\": \"https://example.com\"} (use null if unknown)."
     )
     data = await gemini_json(prompt)
-    if not isinstance(data, dict):
-        return None
-    u = (data.get("travelweekly_url") or "").strip()
-    return u or None
-
-# ----------------------------
-# TravelWeekly parsing (deterministic)
-# ----------------------------
-def parse_chain_code_from_travelweekly(html: str) -> Optional[str]:
-    """
-    TravelWeekly often formats like:
-      Sabre: PW 192496
-      Amadeus: PW WWDRSH
-    We only need the CHAIN CODE (e.g., PW).
-    """
-    if not html:
-        return None
-
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
-
-    # Look for "Sabre:" etc and capture chain token before the code
-    # Example: "Sabre: PW 192496" -> PW
-    patterns = [
-        r"Sabre:\s*([A-Z]{2,3})\s+[A-Z0-9]{3,12}",
-        r"Amadeus:\s*([A-Z]{2,3})\s+[A-Z0-9]{3,12}",
-        r"Worldspan:\s*([A-Z]{2,3})\s+[A-Z0-9]{3,12}",
-        r"Galileo/Apollo:\s*([A-Z]{2,3})\s+[A-Z0-9]{3,12}",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text)
-        if m:
-            return m.group(1).strip()
-
+    if isinstance(data, dict):
+        u = (data.get("url") or "").strip()
+        return u or None
     return None
 
-def extract_booking_candidates_from_travelweekly(html: str) -> List[str]:
-    """
-    Pull outbound links from TravelWeekly that look like booking/reservations/vendors.
-    """
-    if not html:
+async def gemini_chain_code_only(hotel_name: str) -> Optional[str]:
+    if not client:
+        return None
+    prompt = (
+        f"What is the GDS chain code for '{hotel_name}'?\n"
+        "Return ONLY JSON: {\"chain_code\": \"PW\"}.\n"
+        "chain_code must be 2-3 uppercase letters, or null if unknown."
+    )
+    data = await gemini_json(prompt)
+    if isinstance(data, dict):
+        cc = (data.get("chain_code") or "").strip()
+        return cc or None
+    return None
+
+async def gemini_booking_urls(hotel_name: str, official_url: Optional[str]) -> List[str]:
+    if not client:
         return []
-    soup = BeautifulSoup(html, "html.parser")
-
-    cands: List[str] = []
+    prompt = (
+        "Find the DIRECT booking engine URL(s) for this hotel (page where guests pick dates/rooms).\n"
+        "Return ONLY JSON: {\"booking_urls\": [\"https://...\", \"https://...\"]}.\n"
+        "Prefer vendor booking URLs (SynXis/iHotelier/TravelClick/Cloudbeds/WebRezPro/etc).\n\n"
+        f"HOTEL: {hotel_name}\n"
+        f"OFFICIAL SITE (if known): {official_url or 'unknown'}\n"
+    )
+    data = await gemini_json(prompt)
+    urls: List[str] = []
+    if isinstance(data, dict):
+        urls = data.get("booking_urls") or []
+    out = []
     seen = set()
+    base = official_url or ""
+    for u in urls:
+        nu = normalize_url(u, base=base)
+        if nu and nu not in seen:
+            seen.add(nu)
+            out.append(nu)
+    return out
 
-    for a in soup.find_all("a", href=True):
-        href = a.get("href", "").strip()
-        if not href:
-            continue
-        full = href
-        if href.startswith("/"):
-            full = urljoin("https://www.travelweekly.com", href)
-        if full and likely_booking_url(full):
-            if full not in seen:
-                seen.add(full)
-                cands.append(full)
-
-    return cands
-
-async def travelweekly_search_fallback(hotel_name: str) -> Optional[str]:
-    """
-    If Gemini didn’t find TW URL, try TW internal search (not Google/Bing UI).
-    """
+# ----------------------------
+# TravelWeekly helper (only used to scrape candidate links if reachable)
+# ----------------------------
+async def travelweekly_internal_search(hotel_name: str) -> Optional[str]:
     q = quote_plus(hotel_name)
-    search_url = f"https://www.travelweekly.com/Search?q={q}"
-
-    status, html = await fetch(search_url)
+    url = f"https://www.travelweekly.com/Search?q={q}"
+    status, html = await fetch(url, timeout_s=25.0)
     if status >= 400 or not html:
         return None
-
     soup = BeautifulSoup(html, "html.parser")
-    links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if "/Hotels/" in href:
-            links.append(urljoin("https://www.travelweekly.com", href))
+            return urljoin("https://www.travelweekly.com", href)
+    return None
 
-    # De-dupe preserve order
+def extract_booking_links_from_html(html: str, base_url: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href:
+            continue
+        full = href if href.startswith(("http://", "https://")) else urljoin(base_url, href)
+        if likely_booking_url(full):
+            links.append(full)
+    # de-dupe
+    out = []
     seen = set()
     for u in links:
         if u not in seen:
             seen.add(u)
-            return u
-    return None
+            out.append(u)
+    return out
 
 # ----------------------------
-# Booking engine selection + screenshot
+# Booking candidates (big list)
 # ----------------------------
-async def choose_accessible_booking_url(candidates: List[str]) -> str:
-    """
-    Pick the first candidate that:
-    - returns non-4xx
-    - is not a verification page
-    - looks like booking UI OR is strongly booking-like
-    """
-    for url in candidates:
-        try:
-            status, html = await fetch(url, timeout_s=20.0)
-            if status >= 400:
-                continue
-            if looks_like_bot_block(html):
-                continue
-            if looks_like_booking_ui(html) or likely_booking_url(url):
-                return url
-        except Exception:
-            continue
-    return ""
+def common_booking_paths(official_url: str) -> List[str]:
+    parsed = urlparse(official_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    return [
+        base + "/book",
+        base + "/booking",
+        base + "/reservations",
+        base + "/reservation",
+        base + "/reserve",
+        base + "/availability",
+        base + "/book-now",
+        base + "/booknow",
+        base + "/rooms",
+        base + "/rates",
+    ]
 
-async def screenshot_booking_engine(url: str) -> None:
+# ----------------------------
+# Playwright attempt loop
+# ----------------------------
+async def try_booking_candidates_with_playwright(candidates: List[str], max_tries: int = 10) -> str:
     """
-    Navigate to booking engine and screenshot booking UI.
-    If blocked, capture BLOCKED evidence.
+    Attempts the first N candidates in Playwright.
+    Saves evidence for each attempt.
+    Returns the winning booking URL if successful, else "".
     """
-    print(f"🧾 Opening booking engine: {url}")
+    attempts = candidates[:max_tries]
+    print(f"🧪 Trying {len(attempts)} booking candidates in Playwright...")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            await asyncio.sleep(3)
-            html = await page.content()
 
-            if looks_like_bot_block(html):
-                print("🧱 Booking engine protected (verification). Capturing evidence.")
-                await page.screenshot(path=os.path.join(ART_DIR, "BOOKING_BLOCKED.png"), full_page=True)
-                write_text("BOOKING_BLOCKED.html", html)
-            else:
-                await page.screenshot(path=os.path.join(ART_DIR, "BOOKING_ENGINE.png"), full_page=True)
-                print("📸 Saved: screenshots/BOOKING_ENGINE.png")
+        try:
+            for i, url in enumerate(attempts, start=1):
+                tag = f"{i:02d}"
+                print(f"➡️ TRY {tag}: {url}")
+
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.sleep(3)
+                    html = await page.content()
+
+                    if looks_like_bot_block(html):
+                        print(f"🧱 BLOCKED {tag}")
+                        await page.screenshot(path=os.path.join(ART_DIR, f"BOOKING_TRY_{tag}_BLOCKED.png"), full_page=True)
+                        write_text(f"BOOKING_TRY_{tag}_BLOCKED.html", html)
+                        continue
+
+                    # If it looks like booking UI, we won.
+                    if looks_like_booking_ui(html) or likely_booking_url(url):
+                        print(f"✅ BOOKING ENGINE FOUND on TRY {tag}")
+                        await page.screenshot(path=os.path.join(ART_DIR, "BOOKING_ENGINE.png"), full_page=True)
+                        return url
+
+                    # Not blocked, but not clearly booking UI
+                    await page.screenshot(path=os.path.join(ART_DIR, f"BOOKING_TRY_{tag}_NOT_BOOKING.png"), full_page=True)
+                    write_text(f"BOOKING_TRY_{tag}_NOT_BOOKING.html", html[:200000])
+
+                except Exception as e:
+                    print(f"⚠️ ERROR {tag}: {repr(e)}")
+                    try:
+                        await page.screenshot(path=os.path.join(ART_DIR, f"BOOKING_TRY_{tag}_ERROR.png"), full_page=True)
+                    except Exception:
+                        pass
+                    continue
+
         finally:
             await browser.close()
+
+    return ""
 
 # ----------------------------
 # Main
 # ----------------------------
 async def main() -> None:
-    write_text("RUN_STATUS.txt", "entered_main\n")
     print("✅ ENTERED main()")
 
     if not EMAIL_INPUT:
@@ -318,39 +336,9 @@ async def main() -> None:
 
     hotel_name = await extract_hotel_name(EMAIL_INPUT)
     print(f"🏨 Property: {hotel_name}")
-    write_json("PROPERTY.json", {"hotel": hotel_name})
 
-    # --- Step 1: Find TravelWeekly hotel page URL (Gemini first, then TW internal search fallback)
-    tw_url = await gemini_find_travelweekly_url(hotel_name) if client else None
-    if not tw_url:
-        print("ℹ️ Gemini did not provide TravelWeekly URL. Trying TravelWeekly internal search...")
-        tw_url = await travelweekly_search_fallback(hotel_name)
-
-    write_json("TRAVELWEEKLY_META.json", {"travelweekly_url": tw_url})
-
-    tw_html = ""
-    if tw_url:
-        print(f"📰 TravelWeekly URL: {tw_url}")
-        status, tw_html = await fetch(tw_url, timeout_s=25.0)
-        if status >= 400 or not tw_html:
-            print(f"⚠️ TravelWeekly fetch failed: HTTP {status}")
-            tw_html = ""
-
-    # --- Step 2: Extract CHAIN CODE (this is the ONLY GDS thing you want)
-    chain_code = parse_chain_code_from_travelweekly(tw_html) if tw_html else None
-
-    # If TravelWeekly failed, ask Gemini for chain code only as a last resort
-    if not chain_code and client:
-        print("ℹ️ TravelWeekly chain code not found. Asking Gemini for CHAIN CODE only...")
-        prompt = (
-            f"What is the GDS chain code for '{hotel_name}'?\n"
-            "Return ONLY JSON: {\"chain_code\": \"PW\"}.\n"
-            "chain_code must be 2-3 uppercase letters, or null if unknown."
-        )
-        data = await gemini_json(prompt)
-        cc = (data or {}).get("chain_code") if isinstance(data, dict) else None
-        chain_code = (cc or "").strip() or None
-
+    # Chain code: ask Gemini for chain code only (fast and focused)
+    chain_code = await gemini_chain_code_only(hotel_name) if client else None
     if chain_code:
         write_text("CHAIN_CODE.txt", chain_code + "\n")
         print(f"✅ Chain code: {chain_code}")
@@ -358,68 +346,62 @@ async def main() -> None:
         write_text("CHAIN_CODE.txt", "UNKNOWN\n")
         print("❌ Chain code not found.")
 
-    # --- Step 3: Build booking engine candidates
+    # Official URL (for extra candidates)
+    official_url = await gemini_official_url(hotel_name) if client else None
+    official_url = normalize_url(official_url) if official_url else ""
+    write_json("PROPERTY_META.json", {"hotel": hotel_name, "official_url": official_url})
+
+    # Build booking candidates
     candidates: List[str] = []
 
-    # 3a) From TravelWeekly outbound links (best chance to avoid protected official site)
-    if tw_html:
-        candidates.extend(extract_booking_candidates_from_travelweekly(tw_html))
+    # 1) Try TravelWeekly internal search (sometimes gives booking-related links)
+    tw_url = await travelweekly_internal_search(hotel_name)
+    tw_html = ""
+    if tw_url:
+        print(f"📰 TravelWeekly result: {tw_url}")
+        status, tw_html = await fetch(tw_url, timeout_s=25.0)
+        if status < 400 and tw_html:
+            candidates.extend(extract_booking_links_from_html(tw_html, tw_url))
+        else:
+            print(f"⚠️ TravelWeekly fetch failed: HTTP {status}")
 
-    # 3b) Ask Gemini directly for booking engine URLs (does not require visiting official site)
-    if client:
-        prompt = (
-            "Find the DIRECT booking engine URL(s) for this hotel (page where guests pick dates/rooms).\n"
-            "Return ONLY JSON: {\"booking_urls\": [\"https://...\", \"https://...\"]}.\n"
-            "Prefer vendor booking URLs (SynXis/iHotelier/TravelClick/Cloudbeds/WebRezPro/etc).\n\n"
-            f"HOTEL: {hotel_name}\n"
-        )
-        data = await gemini_json(prompt)
-        urls = []
-        if isinstance(data, dict):
-            urls = data.get("booking_urls") or []
-        for u in urls:
-            u = (u or "").strip()
-            if u:
-                candidates.append(u)
+    # 2) Gemini booking URLs (most important)
+    candidates.extend(await gemini_booking_urls(hotel_name, official_url or None) if client else [])
 
-    # De-dupe + keep only things that look booking-related
+    # 3) Common paths on official domain (even if homepage is blocked, sometimes /reservations works)
+    if official_url:
+        candidates.extend(common_booking_paths(official_url))
+
+    # Normalize + de-dupe
     cleaned: List[str] = []
     seen = set()
     for u in candidates:
-        u = u.strip()
-        if not u:
+        nu = normalize_url(u, base=official_url if official_url else None)
+        if not nu:
             continue
-        # Normalize relative URLs to TravelWeekly base if needed
-        if u.startswith("/"):
-            u = urljoin("https://www.travelweekly.com", u)
-        if not u.startswith(("http://", "https://")):
-            u = "https://" + u
-        if u not in seen and likely_booking_url(u):
-            seen.add(u)
-            cleaned.append(u)
+        if nu in seen:
+            continue
+        seen.add(nu)
+        cleaned.append(nu)
 
-    write_json("BOOKING_CANDIDATES.json", {"hotel": hotel_name, "candidates": cleaned})
+    # Save candidates
+    write_json("BOOKING_CANDIDATES.json", {"hotel": hotel_name, "official_url": official_url, "candidates": cleaned})
 
-    # --- Step 4: Choose and screenshot booking engine
-    booking_url = await choose_accessible_booking_url(cleaned) if cleaned else ""
+    # Now actually TRY candidates in Playwright and keep evidence
+    booking_url = await try_booking_candidates_with_playwright(cleaned, max_tries=10)
+
     if booking_url:
         write_text("RUN_STATUS.txt", f"booking_url={booking_url}\n")
-        await screenshot_booking_engine(booking_url)
+        print(f"🎯 SUCCESS: {booking_url}")
     else:
-        # If nothing accessible, record that clearly
         write_text("RUN_STATUS.txt", "no_accessible_booking_engine\n")
-        print("❌ No accessible booking engine URL found (without verification).")
-
-        # Save evidence (TravelWeekly HTML) for debugging if available
-        if tw_html:
-            write_text("TRAVELWEEKLY_PAGE.html", tw_html[:200000])
+        print("❌ No accessible booking engine found in top candidates (without verification).")
 
 if __name__ == "__main__":
     print("✅ ENTERED __main__")
     try:
         asyncio.run(main())
     except Exception as e:
-        # Always produce a crash artifact
         write_text("CRASH.txt", f"Script crashed:\n{repr(e)}\n")
         raise
 
