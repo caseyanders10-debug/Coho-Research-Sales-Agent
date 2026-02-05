@@ -8,11 +8,13 @@ HOTEL_NAME = os.environ.get("EMAIL_INPUT", "The Reeds at Shelter Haven")
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 async def ask_gemini_with_retry(name, retries=3):
-    """Handles Rate Limits (429) to get GDS codes."""
-    prompt = f"Provide ACTUAL GDS codes for '{name}'. Return ONLY JSON: {{'found': true, 'chain': 'PW', 'sabre': '192496', 'amadeus': 'WWDRSH'}}"
+    """Refined AI search to ensure we get real IDs."""
+    prompt = (f"Search for the GDS codes for '{name}'. "
+              "Return ONLY a JSON object with keys: found, chain, sabre, amadeus, apollo, worldspan. "
+              "Example: {'found': true, 'chain': 'PW', 'sabre': '192496', 'amadeus': 'WWDRSH', 'apollo': '44708', 'worldspan': 'ACYRS'}")
     for i in range(retries):
         try:
-            print(f"🤖 AI Attempt {i+1}...")
+            print(f"🤖 AI Lookup (Attempt {i+1})...")
             response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
             data = json.loads(response.text.strip().replace('```json', '').replace('```', ''))
             if data.get('sabre') and "123" not in str(data.get('sabre')):
@@ -26,31 +28,47 @@ async def ask_gemini_with_retry(name, retries=3):
 async def main():
     os.makedirs("screenshots", exist_ok=True)
     
-    # 1. GET DATA FIRST
+    # 1. GET DATA
     gds_data = await ask_gemini_with_retry(HOTEL_NAME)
     
-    # 2. SAVE DATA IMMEDIATELY (Safety Step)
+    # 2. SAVE FORMATTED REPORT (Matches your requested layout)
     if gds_data:
-        print(f"✅ AI SUCCESS: {gds_data['sabre']}")
-        report = f"PROPERTY: {HOTEL_NAME}\nSABRE: {gds_data['chain']}{gds_data['sabre']}\nAMADEUS: {gds_data['amadeus']}"
+        c = gds_data.get('chain', '??')
+        report = (
+            f"--- GDS PROPERTY SNAPSHOT ---\n"
+            f"PROPERTY:  {HOTEL_NAME}\n"
+            f"CHAIN:     {c}\n"
+            f"-----------------------------\n"
+            f"SABRE:     {c}{gds_data.get('sabre', 'N/A')}\n"
+            f"AMADEUS:   {c}{gds_data.get('amadeus', 'N/A')}\n"
+            f"APOLLO:    {c}{gds_data.get('apollo', 'N/A')}\n"
+            f"WORLDSPAN: {c}{gds_data.get('worldspan', 'N/A')}\n"
+            f"-----------------------------"
+        )
         with open(f"screenshots/GDS_REPORT.txt", "w") as f:
             f.write(report)
-    
-    # 3. WEB SEARCH (Now Optional - won't kill the script if Google blocks us)
-    print("⏲️ Waiting before web proof...")
-    await asyncio.sleep(5)
-    
+        print("✅ Clean report generated.")
+
+    # 3. WEB PROOF (Using DuckDuckGo to bypass Google CAPTCHA)
+    print("🌐 Launching DuckDuckGo to bypass CAPTCHA...")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         try:
-            # Bypass Google search and try a direct URL guess to avoid CAPTCHAs
-            print(f"🌐 Attempting direct site proof...")
-            await page.goto(f"https://www.google.com/search?q={HOTEL_NAME.replace(' ', '+')}+official+website")
-            # Take whatever screen we get (even if it's a captcha) so you can see why it failed
-            await page.screenshot(path="screenshots/web_attempt.png")
-        except:
-            print("⚠️ Web proof timed out, but GDS report is already saved.")
+            # DuckDuckGo is much more lenient with automated scripts
+            ddg_url = f"https://duckduckgo.com/?q={HOTEL_NAME.replace(' ', '+')}+official+site"
+            await page.goto(ddg_url, wait_until="networkidle")
+            
+            # Click the first result on DuckDuckGo (usually '[data-testid="result-title-a"]')
+            await page.locator('a[data-testid="result-title-a"]').first.click()
+            await page.wait_for_load_state("networkidle")
+            
+            # Final Screenshot of the official site
+            await page.screenshot(path="screenshots/Booking_Engine_Proof.png", full_page=True)
+            print("📸 Web proof saved via DuckDuckGo.")
+        except Exception as e:
+            print(f"⚠️ Web proof failed: {e}")
+            await page.screenshot(path="screenshots/web_stuck_debug.png")
         finally:
             await browser.close()
 
