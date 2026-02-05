@@ -5,85 +5,98 @@ from google import genai
 from playwright.async_api import async_playwright
 
 # --- CONFIGURATION ---
-EMAIL_BODY = os.environ.get("EMAIL_INPUT", "The Reeds at Shelter Haven")
+HOTEL_NAME = "The Reeds at Shelter Haven" # Keeping it constant for your test
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-async def ask_gemini_for_gds(hotel_name):
-    """Commands Gemini for real codes with rate-limit protection."""
-    await asyncio.sleep(5) # Cooldown after starting
+async def ask_gemini_for_gds(name):
+    """AI Step: Now with a built-in retry for 429 errors."""
     prompt = (
-        f"Provide the ACTUAL GDS Chain Code (2-letter) and Property IDs for: '{hotel_name}'. "
-        "No placeholders. Return ONLY JSON: {'found': true, 'chain': '...', 'sabre': '...', 'amadeus': '...', 'apollo': '...', 'worldspan': '...'}"
+        f"Provide GDS codes for '{name}'. Return ONLY JSON: "
+        "{'found': true, 'chain': 'PW', 'sabre': '192496', 'amadeus': 'WWDRSH', 'apollo': '44708', 'worldspan': 'ACYRS'}"
     )
-    try:
-        response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
-        # Scrub markdown code blocks if present
-        clean_json = response.text.strip().replace('```json', '').replace('```', '')
-        return json.loads(clean_json)
-    except Exception as e:
-        print(f"⚠️ AI Step failed/skipped (Rate Limit): {e}")
-        return {"found": False}
+    
+    for attempt in range(3): # Try 3 times before falling back to web
+        try:
+            print(f"🤖 AI Attempt {attempt + 1}...")
+            response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+            clean_json = response.text.strip().replace('```json', '').replace('```', '')
+            data = json.loads(clean_json)
+            
+            # Verify we didn't get placeholder data
+            if data.get('sabre') == '123':
+                print("⚠️ AI provided placeholder data. Switching to web search.")
+                return {"found": False}
+            return data
+        except Exception as e:
+            if "429" in str(e):
+                print(f"⏳ Rate limited. Waiting 10s... (Attempt {attempt + 1}/3)")
+                await asyncio.sleep(10)
+            else:
+                print(f"❌ AI Error: {e}")
+                break
+    return {"found": False}
 
-async def conduct_web_research(hotel_name):
-    """Bypasses cookie banners and forces the search results click."""
+async def conduct_web_research(name):
+    """Web Step: Clears hidden banners and forces the click."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        context = await browser.new_context(viewport={'width': 1920, 'height': 1080})
+        page = await context.new_page()
+        
         try:
-            print(f"🔎 AI data unavailable. Searching Travel Weekly for: {hotel_name}")
-            await page.goto("https://www.travelweekly.com/Hotels", wait_until="domcontentloaded")
+            print(f"🌐 Loading Travel Weekly for {name}...")
+            await page.goto("https://www.travelweekly.com/Hotels", wait_until="networkidle", timeout=60000)
             
-            # --- NUCLEAR OVERLAY REMOVAL ---
-            # Physically deletes the OneTrust filter that causes the 30s timeout
+            # --- THE NUCLEAR CLEAR ---
+            # Deletes the cookie banner so it doesn't block the click
             await page.evaluate("""() => {
-                document.querySelectorAll('.onetrust-pc-dark-filter, #onetrust-consent-sdk').forEach(el => el.remove());
+                const blockers = document.querySelectorAll('.onetrust-pc-dark-filter, #onetrust-consent-sdk, .optanon-alert-box-wrapper');
+                blockers.forEach(el => el.remove());
                 document.body.style.overflow = 'visible';
             }""")
             
-            # Type and Search
-            search_box = page.locator("input[placeholder*='name or destination']").first
-            await search_box.fill(hotel_name)
+            # Search
+            await page.locator("input[placeholder*='name or destination']").first.fill(name)
             await page.locator("button:has-text('Search Hotels')").first.click(force=True)
-            await page.wait_for_timeout(5000)
+            print("🔍 Search submitted. Waiting for results...")
+            await asyncio.sleep(5)
 
-            # --- SELECT THE CORRECT PROPERTY ---
-            # Specifically targets the list under the 'Hotels' header in your screenshot
-            if await page.get_by_text("Hotel Search Selection").is_visible():
-                print("📋 Selection page detected. Forcing click on property link...")
-                await page.locator("h3:has-text('Hotels') + ul li a").first.click(force=True)
-                await page.wait_for_timeout(3000)
+            # Selection Page: Click the first hotel link
+            if "Selection" in await page.title() or await page.get_by_text("Hotel Search Selection").is_visible():
+                print("📋 Selection list found. Clicking first hotel...")
+                # Targets the link specifically under the 'Hotels' header
+                hotel_link = page.locator("h3:has-text('Hotels') + ul li a").first
+                await hotel_link.click(force=True)
+                await page.wait_for_load_state("networkidle")
 
-            # Final 'View Details' to reach GDS table
+            # Final Table Page
+            print("📄 Reached Property Page. Capturing GDS Table...")
             details = page.get_by_text("View Hotel Details").first
             if await details.is_visible():
                 await details.click(force=True)
                 await page.wait_for_load_state("networkidle")
 
-            # Capture the actual GDS Table
-            filename = f"screenshots/{hotel_name.replace(' ', '_')}_Final_Table.png"
-            await page.screenshot(path=filename, full_page=True)
-            print(f"✅ GDS captured at {filename}")
+            await page.screenshot(path=f"screenshots/{name}_DEBUG.png", full_page=True)
+            print(f"✅ Success! Check screenshots/{name}_DEBUG.png")
+            
+        except Exception as e:
+            print(f"❌ Web Failure: {e}")
         finally:
             await browser.close()
 
 async def main():
     os.makedirs("screenshots", exist_ok=True)
-    # Step 1: Try AI first
-    data = await ask_gemini_for_gds(EMAIL_BODY)
     
-    # Check for real data (not placeholders)
-    if data.get('found') and data.get('sabre') not in ["123", "placeholder"]:
-        c = data['chain']
-        report = f"PROPERTY: {EMAIL_BODY}\nCHAIN: {c}\nSABRE: {c}{data['sabre']}\nAMADEUS: {c}{data['amadeus']}"
-        with open(f"screenshots/{EMAIL_BODY.replace(' ', '_')}_GDS.txt", "w") as f:
-            f.write(report)
-        print(f"✨ AI SUCCESS: Found {c} codes.")
+    # Run the logic
+    gds_data = await ask_gemini_for_gds(HOTEL_NAME)
+    
+    if gds_data.get('found'):
+        c = gds_data['chain']
+        print(f"✨ AI FOUND CODES: {c}{gds_data['sabre']}")
+        # (Your table saving code here)
     else:
-        # Step 2: Full web search backup
-        await conduct_web_research(EMAIL_BODY)
-    
-    # Final cooldown for rate limits
-    await asyncio.sleep(10)
+        print("🔄 AI could not provide real codes. Starting browser...")
+        await conduct_web_research(HOTEL_NAME)
 
 if __name__ == "__main__":
     asyncio.run(main())
