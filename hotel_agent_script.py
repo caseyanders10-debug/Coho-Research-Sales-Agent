@@ -7,29 +7,29 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential
 from playwright.async_api import async_playwright
 
 # --- CONFIGURATION ---
+# Ensure these environment variables are set in your GitHub Secrets or local environment
 EMAIL_BODY = os.environ.get("EMAIL_INPUT", "No email provided")
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+
+client = genai.Client(api_key=GEMINI_KEY)
 
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(5))
 async def get_hotel_list_from_ai(text):
-    """Extracts hotels from email."""
+    """Step 1: Extract hotel names and URLs from the email body."""
     prompt = f"Extract hotel name and official URL. Return ONLY a JSON list: [{{'name': '...', 'url': '...'}}]. Text: {text}"
     response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
     return json.loads(response.text.strip().replace('```json', '').replace('```', ''))
 
 async def ask_gemini_for_gds(hotel_name):
-    """
-    NEW PROMPT: Higher confidence.
-    Commands Gemini to search and provide the best available data.
-    """
+    """Step 2: Command Gemini to provide GDS codes directly (The Fast Track)."""
     prompt = (
         f"Search your knowledge and the web for the GDS Chain Code and Property IDs "
-        f"(Sabre, Amadeus, Apollo/Galileo, Worldspan) for: '{hotel_name}'. "
-        "Return ONLY a JSON object: {'found': true, 'chain': '...', 'sabre': '...', 'amadeus': '...', 'apollo': '...', 'worldspan': '...'}. "
-        "Only set 'found' to false if the property absolutely cannot be identified."
+        f"(Sabre, Amadeus, Apollo/Galileo, Worldspan) for the property: '{hotel_name}'. "
+        "Return ONLY a JSON object with these exact keys: "
+        "'found' (boolean), 'chain', 'sabre', 'amadeus', 'apollo', 'worldspan'. "
+        "Use your search capabilities. Only set 'found' to false if the property cannot be found."
     )
     try:
-        # We use the flash model for speed, but tell it to be thorough
         response = client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
         data = json.loads(response.text.strip().replace('```json', '').replace('```', ''))
         return data
@@ -37,38 +37,31 @@ async def ask_gemini_for_gds(hotel_name):
         return {"found": False}
 
 async def nuclear_clear_blockers(page):
-    """Removes 'OneTrust' and other dark overlays preventing clicks."""
+    """Removes invisible overlays (OneTrust/Cookie banners) that block clicks."""
     try:
         await page.evaluate("""() => {
             const blockers = document.querySelectorAll('.onetrust-pc-dark-filter, #onetrust-consent-sdk, .optanon-alert-box-wrapper');
             blockers.forEach(el => el.remove());
-            document.body.style.overflow = 'visible'; // Ensure we can scroll
+            document.body.style.overflow = 'visible';
         }""")
     except: pass
 
 async def handle_selection_page(page, target_name):
-    """
-    NAVIGATES THE LIST: Fixes the 'The Reeds' issue.
-    Clicks the first link under the 'Hotels' h3 header.
-    """
-    print(f"📋 Selection page detected. Forcing click on property link...")
+    """Navigates the intermediate search results list (e.g., 'The Reeds' selection)."""
+    print(f"📋 Selection page detected. Navigating to property details...")
     try:
-        # Targets the exact structure in your screenshot (h3 Hotels -> ul -> li -> a)
+        # Targets the link under the 'Hotels' header specifically
         hotel_link = page.locator("h3:has-text('Hotels') + ul li a").first
-        
         if await hotel_link.count() > 0:
             await hotel_link.scroll_into_view_if_needed()
-            # Force click is mandatory here because of the invisible layers
             await hotel_link.click(force=True)
-            print(f"🔗 Link clicked. Waiting for property page load...")
             await page.wait_for_load_state("networkidle")
             return True
-    except Exception as e:
-        print(f"⚠️ Navigation error: {e}")
+    except: pass
     return False
 
 async def conduct_web_research(hotel_name, official_url):
-    """The Fail-Safe: Full browser search."""
+    """Step 3: The Backup - Full Playwright browser search on Travel Weekly."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121.0.0.0 Safari/537.36")
@@ -78,7 +71,7 @@ async def conduct_web_research(hotel_name, official_url):
             # 1. Official Site Snapshot
             if official_url:
                 await page.goto(official_url, wait_until="networkidle", timeout=30000)
-                await page.screenshot(path=f"screenshots/{hotel_name}_Official.png")
+                await page.screenshot(path=f"screenshots/{hotel_name.replace(' ', '_')}_Official.png")
 
             # 2. Travel Weekly Search
             print(f"🔎 AI data unavailable. Searching Travel Weekly for: {hotel_name}")
@@ -90,27 +83,45 @@ async def conduct_web_research(hotel_name, official_url):
             await page.locator("button:has-text('Search Hotels')").first.click(force=True)
             await page.wait_for_timeout(5000)
 
-            # 3. CLICK THE PROPERTY (Fixes the screenshot-only issue)
+            # 3. Handle the 'The Reeds' Selection List
             if "Selection" in await page.title() or await page.get_by_text("Hotel Search Selection").is_visible():
                 await handle_selection_page(page, hotel_name)
                 await page.wait_for_timeout(3000)
 
-            # 4. Final 'View Details' Click
+            # 4. Click 'View Hotel Details'
             details = page.get_by_text("View Hotel Details").first
             if await details.is_visible():
                 await details.click(force=True)
                 await page.wait_for_load_state("networkidle")
 
-            # 5. Take Final Screenshot of the GDS Table
-            await page.screenshot(path=f"screenshots/{hotel_name}_GDS_Table.png", full_page=True)
-            print(f"✅ GDS captured for {hotel_name}")
+            # 5. Take Final Screenshot
+            await page.screenshot(path=f"screenshots/{hotel_name.replace(' ', '_')}_GDS_Table.png", full_page=True)
             return True
-
         except Exception as e:
-            print(f"❌ Web research failed: {e}")
+            print(f"❌ Web research failed for {hotel_name}: {e}")
             return False
         finally:
             await browser.close()
+
+def save_formatted_report(name, data):
+    """Saves the GDS data in a professional table format with two-letter codes."""
+    chain = data.get('chain', '??')
+    report = (
+        f"GDS REPORT: {name}\n"
+        f"{'='*40}\n"
+        f"CHAIN CODE: {chain}\n"
+        f"{'-'*40}\n"
+        f"AMADEUS:    {chain} {data.get('amadeus', 'N/A')}\n"
+        f"SABRE:      {chain} {data.get('sabre', 'N/A')}\n"
+        f"GALILEO:    {chain} {data.get('apollo', 'N/A')}\n"
+        f"WORLDSPAN:  {chain} {data.get('worldspan', 'N/A')}\n"
+        f"{'='*40}\n"
+        f"Host Entry Format: {chain}{data.get('sabre', '')}\n"
+    )
+    filename = f"screenshots/{name.replace(' ', '_')}_GDS_SUMMARY.txt"
+    with open(filename, "w") as f:
+        f.write(report)
+    print(f"📄 Saved professional report to {filename}")
 
 async def main():
     os.makedirs("screenshots", exist_ok=True)
@@ -120,14 +131,14 @@ async def main():
         name = hotel['name']
         print(f"\n--- Processing: {name} ---")
         
-        # TRY AI FIRST (With new aggressive prompt)
+        # TRY AI FIRST
         gds_data = await ask_gemini_for_gds(name)
         
         if gds_data.get('found'):
-            print(f"✨ Gemini identified codes: {gds_data['chain']} / {gds_data['sabre']}")
-            with open(f"screenshots/{name}_GDS_AI_DATA.txt", "w") as f:
-                f.write(json.dumps(gds_data, indent=4))
+            print(f"✨ AI Found Data! Chain: {gds_data['chain']}")
+            save_formatted_report(name, gds_data)
         else:
+            # RUN WEB SEARCH BACKUP
             await conduct_web_research(name, hotel['url'])
         
         await asyncio.sleep(2)
