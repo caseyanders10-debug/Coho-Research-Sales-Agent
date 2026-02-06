@@ -1,5 +1,5 @@
-playwright
 google-genai
 httpx
 beautifulsoup4
 openpyxl
+playwright
