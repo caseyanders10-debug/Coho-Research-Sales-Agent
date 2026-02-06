@@ -4,15 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       email_body:
-        description: "Paste the raw email content or hotel name here"
+        description: 'Paste the raw ZoomInfo email body (or a single hotel name)'
         required: true
         type: string
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -20,8 +18,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-          cache: "pip"
+          python-version: '3.10'
 
       - name: Install Dependencies
         run: |
@@ -46,13 +43,14 @@ jobs:
           ls -la
           echo "Screenshots dir:"
           ls -la screenshots || true
-          echo "Find any png/json/txt/html:"
-          find . -maxdepth 3 -type f \( -name "*.png" -o -name "*.json" -o -name "*.txt" -o -name "*.html" \) -print
+          echo "Find generated files:"
+          find . -maxdepth 3 -type f \( -name "*.xlsx" -o -name "*.json" -o -name "*.txt" -o -name "*.png" -o -name "*.html" \) -print
 
       - name: Upload Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hotel-snapshots
+          name: hotel-output
           path: screenshots/
+          if-no-files-found: warn
 
