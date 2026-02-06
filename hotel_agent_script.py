@@ -1,8 +1,9 @@
 import asyncio
 import os
-import json
 import re
-from typing import Optional, Dict, Any, List, Tuple
+import json
+from dataclasses import dataclass, asdict
+from typing import List, Optional, Tuple, Dict
 from urllib.parse import urljoin, urlparse, quote_plus
 
 import httpx
@@ -11,18 +12,38 @@ from google import genai
 from openpyxl import Workbook
 
 
-# ==============================
-# PURPOSE (Step 1 + Step 2 only)
-# Step 1: Chain code -> CHAIN_CODE.txt
-# Step 2: Booking engine link -> BOOKING_ENGINE_URL.txt
-# Also writes an Excel file -> HOTEL_OUTPUT.xlsx (single-row for now)
-# ==============================
+# ==========================================================
+# HOTEL INTELLIGENCE AGENT (Phase 1)
+#
+# Input:
+#   EMAIL_INPUT (either a single hotel name OR ZoomInfo weekly email body)
+#
+# Output artifacts (in screenshots/):
+#   - HOTEL_OUTPUT.xlsx  (single sheet, many rows when list is provided)
+#   - RUN_STATUS.txt
+#   - PARSED_PROPERTIES.json
+#   - BOOKING_EVIDENCE.json
+#
+# What it collects per property:
+#   - Hotel Name
+#   - ZoomInfo Category (if available)
+#   - ZoomInfo Score (if available)
+#   - GDS Chain Code (Gemini)
+#   - Booking Vendor (fingerprinted from evidence)
+#   - Vendor Evidence URL
+#   - Confidence (High/Medium/Low)
+#   - Notes
+#
+# IMPORTANT:
+# - This does NOT bypass CAPTCHAs or verification pages.
+# - It fingerprints vendors using HTML evidence + free search sources.
+# ==========================================================
 
-VERSION = "2026-02-05.8"
+VERSION = "2026-02-06.1"
 print(f"🔥 HOTEL AGENT VERSION: {VERSION} 🔥")
 
-EMAIL_INPUT = os.environ.get("EMAIL_INPUT", "").strip()
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+EMAIL_INPUT = (os.environ.get("EMAIL_INPUT") or "").strip()
+GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
 
 ART_DIR = "screenshots"
 os.makedirs(ART_DIR, exist_ok=True)
@@ -31,38 +52,16 @@ def write_text(filename: str, content: str) -> None:
     with open(os.path.join(ART_DIR, filename), "w", encoding="utf-8") as f:
         f.write(content)
 
-def write_json(filename: str, obj: Any) -> None:
+def write_json(filename: str, obj) -> None:
     with open(os.path.join(ART_DIR, filename), "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2)
 
-def write_excel_single_row(
-    filename: str,
-    hotel_name: str,
-    chain_code: str,
-    booking_url: str,
-    notes: str
-) -> None:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Hotels"
-
-    headers = ["Hotel Name", "GDS Chain Code", "Booking Engine URL", "Notes"]
-    ws.append(headers)
-    ws.append([hotel_name, chain_code, booking_url, notes])
-
-    # basic column width
-    widths = [40, 16, 70, 50]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[chr(64 + i)].width = w
-
-    wb.save(os.path.join(ART_DIR, filename))
-
-# Always create an artifact immediately so upload never fails
+# Ensure at least one artifact exists
 write_text("RUN_STATUS.txt", "starting\n")
 
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# Bot-wall signals (we do NOT bypass; we only detect and avoid)
+# --- Bot wall indicators (we do not bypass, only detect) ---
 BOT_BLOCK_PATTERNS = [
     "are you a human",
     "verify you are human",
@@ -72,42 +71,8 @@ BOT_BLOCK_PATTERNS = [
     "unusual traffic",
     "cloudflare",
     "checking your browser",
+    "security check",
 ]
-
-# Vendor hints: these are often the *real* booking engine providers
-VENDOR_HOST_HINTS = [
-    "synxis.com",
-    "travelclick.com",
-    "ihotelier.com",
-    "secure-reservation",
-    "reservations.",
-    "be.",
-    "cloudbeds.com",
-    "webrezpro.com",
-    "stayntouch",
-    "roomkey",
-    "bookingsuite",
-    "bookingengine",
-]
-
-# Affiliate/OTA hints (still “booking pages” but not official engine)
-AFFILIATE_HINTS = [
-    "guestreservations.com",
-    "reservationdesk.com",
-    "hotelplanner.com",
-    "reservations.com",
-]
-
-BOOKING_HINT_PATTERNS = [
-    r"/booking", r"/book", r"/reservations", r"/reservation", r"/reserve", r"/availability",
-    r"synxis", r"travelclick", r"ihotelier", r"webrezpro", r"cloudbeds",
-    r"secure-reservation", r"bookingengine",
-]
-
-def strip_code_fences(text: str) -> str:
-    if not text:
-        return ""
-    return text.strip().replace("```json", "").replace("```JSON", "").replace("```", "").strip()
 
 def looks_like_bot_block(html: str) -> bool:
     if not html:
@@ -130,18 +95,170 @@ def normalize_url(u: str, base: Optional[str] = None) -> str:
 def host(url: str) -> str:
     return (urlparse(url).netloc or "").lower()
 
-def is_vendor(url: str) -> bool:
+# --- Booking vendor fingerprints ---
+VENDOR_PATTERNS: Dict[str, List[str]] = {
+    "SynXis (Sabre Hospitality)": [
+        "synxis.com", "be.synxis.com", "synxis.com/rez", "synxis.com/reservations",
+    ],
+    "iHotelier / TravelClick (Amadeus)": [
+        "ihotelier.com", "travelclick.com", "reservations.travelclick.com", "secure-reservation",
+    ],
+    "Cloudbeds": [
+        "cloudbeds.com", "hotels.cloudbeds.com",
+    ],
+    "WebRezPro": [
+        "webrezpro.com", "reservations.webrezpro.com",
+    ],
+    "StayNTouch": [
+        "stayntouch", "stayntouch.com",
+    ],
+    "SHR / Windsurfer": [
+        "windsurfer", "windsurfercrs", "shrgroup", "shr.global", "shr",
+    ],
+}
+
+AFFILIATE_PATTERNS = [
+    "guestreservations.com",
+    "reservationdesk.com",
+    "hotelplanner.com",
+    "reservations.com",
+]
+
+def classify_vendor_from_url(url: str) -> Tuple[str, str]:
+    """
+    Returns (vendor_name, confidence_band).
+    confidence_band is only based on URL match strength.
+    """
+    u = (url or "").lower()
     h = host(url)
-    return any(v in h for v in VENDOR_HOST_HINTS)
 
-def is_affiliate(url: str) -> bool:
-    h = host(url)
-    return any(a in h for a in AFFILIATE_HINTS)
+    for vendor, patterns in VENDOR_PATTERNS.items():
+        for p in patterns:
+            if p.lower() in u or p.lower() in h:
+                return vendor, "High"
 
-def looks_like_booking_url(url: str) -> bool:
-    s = (url or "").lower()
-    return any(re.search(p, s) for p in BOOKING_HINT_PATTERNS)
+    for a in AFFILIATE_PATTERNS:
+        if a in h:
+            return "Affiliate/OTA (Not official CRS)", "Low"
 
+    return "Unknown", "Low"
+
+def best_vendor_from_evidence(evidence_urls: List[str]) -> Tuple[str, str, str]:
+    """
+    Pick best vendor + evidence URL + confidence based on evidence list.
+    Preference order:
+      1) Vendor match (High)
+      2) Booking-ish on official domain (Medium)
+      3) Affiliate (Low)
+      4) Unknown (Low)
+    """
+    if not evidence_urls:
+        return "Unknown", "", "Low"
+
+    # Score each URL
+    scored = []
+    for u in evidence_urls:
+        vendor, conf = classify_vendor_from_url(u)
+        score = 0
+        if conf == "High":
+            score += 100
+        if vendor == "Affiliate/OTA (Not official CRS)":
+            score += 10
+        # booking-ish hint
+        if any(x in (u.lower()) for x in ["/book", "/booking", "/reservations", "reservation", "availability"]):
+            score += 15
+        scored.append((score, vendor, conf, u))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    _, vendor, conf, url = scored[0]
+
+    # If it’s unknown but still booking-ish, bump to Medium
+    if vendor == "Unknown" and any(x in url.lower() for x in ["/book", "/booking", "/reservations", "availability"]):
+        conf = "Medium"
+
+    return vendor, url, conf
+
+# --- ZoomInfo email parsing ---
+@dataclass
+class PropertyRow:
+    hotel_name: str
+    category: Optional[str] = None
+    score: Optional[int] = None
+
+def parse_zoominfo_email(body: str) -> List[PropertyRow]:
+    """
+    Tries to parse a ZoomInfo weekly email body containing a list like:
+      <a>Hotel Name</a>  Category  Score
+    Works with:
+      - HTML email text (anchors)
+      - plain text variants
+    """
+    body = (body or "").strip()
+    if not body:
+        return []
+
+    # If it looks like HTML with links, parse anchors
+    rows: List[PropertyRow] = []
+    if "<a" in body.lower() and "</a>" in body.lower():
+        soup = BeautifulSoup(body, "html.parser")
+        # ZoomInfo list usually uses anchors for names
+        anchors = soup.find_all("a")
+        for a in anchors:
+            name = (a.get_text(" ", strip=True) or "").strip()
+            if not name:
+                continue
+            # Ignore obvious navigation links
+            if len(name) < 2:
+                continue
+            rows.append(PropertyRow(hotel_name=name))
+        # De-dupe while preserving order
+        seen = set()
+        out = []
+        for r in rows:
+            if r.hotel_name.lower() not in seen:
+                seen.add(r.hotel_name.lower())
+                out.append(r)
+        return out
+
+    # Plain text fallback:
+    # Attempt to capture lines like:
+    # "The Reeds  Property Management Software  64"
+    # We’ll accept: <name><spaces><category><spaces><score>
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    # Collapse multiple spaces for regex
+    for ln in lines:
+        compact = re.sub(r"\s+", " ", ln).strip()
+        m = re.match(r"^(.*?)(?:\s{1,}|\t+)(Reservation System|Property Management Software|Global Distribution System|.*?)(?:\s{1,}|\t+)(\d{1,3})$", compact, re.IGNORECASE)
+        if m:
+            name = m.group(1).strip()
+            cat = m.group(2).strip()
+            score = int(m.group(3))
+            if name:
+                rows.append(PropertyRow(hotel_name=name, category=cat, score=score))
+
+    # If we found nothing, treat entire input as a single property name
+    return rows
+
+def detect_input_mode(body: str) -> str:
+    """
+    Returns:
+      - "list" if it looks like a ZoomInfo list
+      - "single" otherwise
+    """
+    b = (body or "").strip()
+    if not b:
+        return "single"
+    # crude heuristics
+    if ("Property Management Software" in b) or ("Reservation System" in b) or ("Global Distribution System" in b):
+        return "list"
+    if "<a" in b.lower() and "</a>" in b.lower():
+        return "list"
+    # if short-ish and no line breaks, it's likely a single hotel
+    if "\n" not in b and len(b) <= 140:
+        return "single"
+    return "single"
+
+# --- HTTP helpers ---
 async def fetch(url: str, timeout_s: float = 25.0) -> Tuple[int, str]:
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
@@ -151,39 +268,115 @@ async def fetch(url: str, timeout_s: float = 25.0) -> Tuple[int, str]:
         r = await c.get(url)
         return r.status_code, (r.text or "")
 
-# ----------------------------
-# Gemini helpers (focused)
-# ----------------------------
-async def gemini_json(prompt: str, retries: int = 3, base_delay_s: int = 12) -> Optional[Dict[str, Any]]:
-    if not client:
+# --- FREE search: DuckDuckGo HTML + Lite ---
+async def ddg_html_search(query: str) -> List[str]:
+    q = quote_plus(query)
+    url = f"https://duckduckgo.com/html/?q={q}"
+    try:
+        status, html = await fetch(url, timeout_s=25.0)
+        if status >= 400 or not html:
+            return []
+        soup = BeautifulSoup(html, "html.parser")
+        links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith(("http://", "https://")):
+                links.append(href)
+        # de-dupe
+        out, seen = [], set()
+        for u in links:
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+    except Exception:
+        return []
+
+async def ddg_lite_search(query: str) -> List[str]:
+    q = quote_plus(query)
+    url = f"https://lite.duckduckgo.com/lite/?q={q}"
+    try:
+        status, html = await fetch(url, timeout_s=25.0)
+        if status >= 400 or not html:
+            return []
+        soup = BeautifulSoup(html, "html.parser")
+        links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith(("http://", "https://")):
+                links.append(href)
+        out, seen = [], set()
+        for u in links:
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+    except Exception:
+        return []
+
+def build_vendor_queries(hotel_name: str) -> List[str]:
+    return [
+        f"\"{hotel_name}\" synxis booking",
+        f"\"{hotel_name}\" ihotelier booking",
+        f"\"{hotel_name}\" travelclick reservations",
+        f"\"{hotel_name}\" cloudbeds booking",
+        f"\"{hotel_name}\" webrezpro reservations",
+        f"\"{hotel_name}\" booking engine",
+        f"\"{hotel_name}\" reservations",
+    ]
+
+# --- TravelWeekly internal search (free) ---
+async def travelweekly_internal_search(hotel_name: str) -> Optional[str]:
+    q = quote_plus(hotel_name)
+    url = f"https://www.travelweekly.com/Search?q={q}"
+    try:
+        status, html = await fetch(url, timeout_s=25.0)
+        if status >= 400 or not html:
+            return None
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/Hotels/" in href and "/Travel-News/" not in href:
+                return urljoin("https://www.travelweekly.com", href)
         return None
-    for attempt in range(1, retries + 1):
-        try:
-            print(f"🤖 Gemini request (attempt {attempt}/{retries})...")
-            resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-            raw = strip_code_fences(getattr(resp, "text", "") or "")
-            return json.loads(raw)
-        except Exception as e:
-            print(f"⏳ Gemini attempt {attempt} failed: {e}")
-            await asyncio.sleep(base_delay_s * attempt)
-    return None
+    except Exception:
+        return None
 
-async def extract_hotel_name(raw_email_or_name: str) -> str:
-    if raw_email_or_name and len(raw_email_or_name) <= 140 and "\n" not in raw_email_or_name:
-        return raw_email_or_name.strip()
+def extract_vendorish_links_from_html(html: str, base_url: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    found = []
+    for tag in soup.find_all(["a", "script", "iframe", "link"]):
+        url = None
+        if tag.name == "a" and tag.get("href"):
+            url = tag.get("href")
+        elif tag.name == "script" and tag.get("src"):
+            url = tag.get("src")
+        elif tag.name == "iframe" and tag.get("src"):
+            url = tag.get("src")
+        elif tag.name == "link" and tag.get("href"):
+            url = tag.get("href")
 
-    if not client:
-        return "UNKNOWN_PROPERTY"
+        if not url:
+            continue
 
-    prompt = (
-        "Extract the hotel/property name from the email below.\n"
-        "Return ONLY JSON like: {\"hotel_name\": \"The Reeds at Shelter Haven\"}.\n\n"
-        f"EMAIL:\n{raw_email_or_name}"
-    )
-    data = await gemini_json(prompt)
-    name = (data or {}).get("hotel_name") if isinstance(data, dict) else None
-    return (name or "UNKNOWN_PROPERTY").strip()
+        full = normalize_url(url, base=base_url)
+        h = host(full)
+        # Keep anything that looks vendor/booking/affiliate
+        if any(p.lower() in full.lower() for plist in VENDOR_PATTERNS.values() for p in plist):
+            found.append(full)
+        elif any(a in h for a in AFFILIATE_PATTERNS):
+            found.append(full)
+        elif any(x in full.lower() for x in ["/booking", "/book", "/reservations", "/availability", "reservation"]):
+            found.append(full)
 
+    out, seen = [], set()
+    for u in found:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+# --- Gemini: Chain code only (simple, focused) ---
 async def gemini_chain_code_only(hotel_name: str) -> str:
     if not client:
         return "UNKNOWN"
@@ -192,256 +385,235 @@ async def gemini_chain_code_only(hotel_name: str) -> str:
         "Return ONLY JSON: {\"chain_code\": \"PW\"}.\n"
         "chain_code must be 2-3 uppercase letters, or null if unknown."
     )
-    data = await gemini_json(prompt)
-    cc = ""
-    if isinstance(data, dict):
-        cc = (data.get("chain_code") or "").strip()
-    return cc or "UNKNOWN"
+    for attempt in range(1, 4):
+        try:
+            print(f"🤖 Gemini chain code (attempt {attempt}/3)...")
+            resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+            text = (resp.text or "").strip()
+            text = text.replace("```json", "").replace("```", "").strip()
+            data = json.loads(text)
+            cc = (data.get("chain_code") or "").strip()
+            return cc or "UNKNOWN"
+        except Exception as e:
+            print(f"⏳ Gemini chain code failed: {e}")
+            await asyncio.sleep(6 * attempt)
+    return "UNKNOWN"
 
-async def gemini_booking_urls_only(hotel_name: str) -> List[str]:
-    """
-    IMPORTANT: We are not asking Gemini to browse; just to provide likely direct booking URLs.
-    """
+# --- Gemini: official URL (optional helper) ---
+async def gemini_official_url(hotel_name: str) -> Optional[str]:
     if not client:
-        return []
-    prompt = (
-        "Find the DIRECT booking engine URL(s) for this hotel (page where guests pick dates/rooms).\n"
-        "Return ONLY JSON: {\"booking_urls\": [\"https://...\", \"https://...\"]}.\n"
-        "Prefer vendor booking URLs (SynXis/iHotelier/TravelClick/Cloudbeds/WebRezPro/etc).\n\n"
-        f"HOTEL: {hotel_name}\n"
-    )
-    data = await gemini_json(prompt)
-    urls = []
-    if isinstance(data, dict):
-        urls = data.get("booking_urls") or []
-    out, seen = [], set()
-    for u in urls:
-        nu = normalize_url(u)
-        if nu and nu not in seen:
-            seen.add(nu)
-            out.append(nu)
-    return out
-
-# ----------------------------
-# TravelWeekly internal search (free)
-# ----------------------------
-async def travelweekly_internal_search(hotel_name: str) -> Optional[str]:
-    q = quote_plus(hotel_name)
-    url = f"https://www.travelweekly.com/Search?q={q}"
-    status, html = await fetch(url, timeout_s=25.0)
-    if status >= 400 or not html:
         return None
-
-    soup = BeautifulSoup(html, "html.parser")
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        # Only hotel detail pages, not travel news
-        if "/Hotels/" in href and "/Travel-News/" not in href:
-            return urljoin("https://www.travelweekly.com", href)
+    prompt = f"Provide the official website URL for '{hotel_name}'. Return ONLY JSON: {{\"url\": \"https://example.com\"}}"
+    for attempt in range(1, 4):
+        try:
+            print(f"🤖 Gemini official URL (attempt {attempt}/3)...")
+            resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+            text = (resp.text or "").strip()
+            text = text.replace("```json", "").replace("```", "").strip()
+            data = json.loads(text)
+            u = (data.get("url") or "").strip()
+            return normalize_url(u) if u else None
+        except Exception as e:
+            print(f"⏳ Gemini official URL failed: {e}")
+            await asyncio.sleep(6 * attempt)
     return None
 
-def extract_bookingish_links_from_html(html: str, base_url: str) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    found = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if not href:
-            continue
-        full = href if href.startswith(("http://", "https://")) else urljoin(base_url, href)
-        if looks_like_booking_url(full) or is_vendor(full) or is_affiliate(full):
-            found.append(full)
+# --- Per-property booking vendor fingerprinting ---
+@dataclass
+class BookingFinding:
+    hotel_name: str
+    evidence_urls: List[str]
+    vendor: str
+    vendor_evidence_url: str
+    confidence: str
+    notes: str
 
-    # de-dupe preserve order
-    out, seen = [], set()
-    for u in found:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
+async def fingerprint_booking_vendor(hotel_name: str) -> BookingFinding:
+    evidence: List[str] = []
+    notes: List[str] = []
 
-# ----------------------------
-# FREE web discovery: DuckDuckGo HTML + Lite (no API key)
-# ----------------------------
-def ddg_queries(hotel_name: str) -> List[str]:
-    return [
-        f"\"{hotel_name}\" booking engine",
-        f"\"{hotel_name}\" reservations",
-        f"\"{hotel_name}\" synxis",
-        f"\"{hotel_name}\" ihotelier",
-        f"\"{hotel_name}\" travelclick",
-        f"\"{hotel_name}\" cloudbeds",
-        f"\"{hotel_name}\" webrezpro",
-    ]
-
-async def ddg_html_search(query: str) -> List[str]:
-    q = quote_plus(query)
-    url = f"https://duckduckgo.com/html/?q={q}"
-    status, html = await fetch(url, timeout_s=25.0)
-    if status >= 400 or not html:
-        return []
-    soup = BeautifulSoup(html, "html.parser")
-
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        # often direct links appear; sometimes DDG wraps them, but we keep it simple
-        if href.startswith(("http://", "https://")):
-            links.append(href)
-
-    out, seen = [], set()
-    for u in links:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
-
-async def ddg_lite_search(query: str) -> List[str]:
-    q = quote_plus(query)
-    url = f"https://lite.duckduckgo.com/lite/?q={q}"
-    status, html = await fetch(url, timeout_s=25.0)
-    if status >= 400 or not html:
-        return []
-    soup = BeautifulSoup(html, "html.parser")
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if href.startswith(("http://", "https://")):
-            links.append(href)
-    out, seen = [], set()
-    for u in links:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
-
-# ----------------------------
-# Choose best booking engine link
-# ----------------------------
-def score_candidate(url: str) -> int:
-    """
-    Prefer vendor booking engines.
-    Fall back to affiliate booking pages if that’s all we can find.
-    """
-    s = url.lower()
-    score = 0
-    if is_vendor(url):
-        score += 100
-    if is_affiliate(url):
-        score += 25
-    if "/booking" in s or "/reservations" in s or "/reservation" in s:
-        score += 15
-    if looks_like_booking_url(url):
-        score += 10
-    return score
-
-async def filter_reachable_nonblocked(urls: List[str], max_check: int = 25) -> List[Tuple[str, int]]:
-    """
-    Try to fetch pages (httpx). Remove obvious bot walls.
-    Return list of (final_url, score) in preference order.
-    """
-    results: List[Tuple[str, int]] = []
-    for u in urls[:max_check]:
+    # 1) TravelWeekly hotel page -> extract vendor-ish links
+    tw_url = await travelweekly_internal_search(hotel_name)
+    if tw_url:
+        notes.append(f"TravelWeekly hotel page found.")
         try:
-            status, html = await fetch(u, timeout_s=20.0)
-            if status >= 400 or not html:
-                continue
-            if looks_like_bot_block(html):
-                continue
-            # If the page contains vendor host links, treat as strong
-            # (sometimes the booking link is embedded in HTML)
-            bonus = 0
-            lower = html.lower()
-            if any(v in lower for v in VENDOR_HOST_HINTS):
-                bonus += 50
-            results.append((u, score_candidate(u) + bonus))
-        except Exception:
-            continue
-    results.sort(key=lambda x: x[1], reverse=True)
-    return results
+            status, html = await fetch(tw_url, timeout_s=25.0)
+            if status < 400 and html and not looks_like_bot_block(html):
+                evidence.extend(extract_vendorish_links_from_html(html, tw_url))
+            else:
+                notes.append(f"TravelWeekly fetch blocked/unavailable (HTTP {status}).")
+        except Exception as e:
+            notes.append(f"TravelWeekly fetch error: {repr(e)}")
+    else:
+        notes.append("TravelWeekly hotel page not found.")
 
-async def main() -> None:
-    print("✅ ENTERED main()")
+    # 2) Official website HTML (via Gemini URL) -> look for scripts/iframes/booking links
+    official_url = await gemini_official_url(hotel_name)
+    if official_url:
+        notes.append(f"Official URL candidate: {official_url}")
+        try:
+            status, html = await fetch(official_url, timeout_s=25.0)
+            if status < 400 and html:
+                if looks_like_bot_block(html):
+                    notes.append("Official site HTML appears bot-blocked; skipping deep parse.")
+                else:
+                    evidence.extend(extract_vendorish_links_from_html(html, official_url))
+            else:
+                notes.append(f"Official site fetch failed (HTTP {status}).")
+        except Exception as e:
+            notes.append(f"Official site fetch error: {repr(e)}")
+    else:
+        notes.append("Official URL not available from Gemini.")
 
+    # 3) Free search (DuckDuckGo HTML + lite fallback) -> collect vendor/affiliate/booking URLs
+    for q in build_vendor_queries(hotel_name):
+        links = await ddg_html_search(q)
+        if not links:
+            links = await ddg_lite_search(q)
+        # Keep only strong candidates (vendor/affiliate/booking-ish)
+        for u in links[:25]:
+            u2 = normalize_url(u)
+            if not u2:
+                continue
+            h = host(u2)
+            if any(p.lower() in u2.lower() for plist in VENDOR_PATTERNS.values() for p in plist):
+                evidence.append(u2)
+            elif any(a in h for a in AFFILIATE_PATTERNS):
+                evidence.append(u2)
+            elif any(x in u2.lower() for x in ["/booking", "/book", "/reservations", "reservation", "availability"]):
+                evidence.append(u2)
+
+    # De-dupe evidence
+    dedup, seen = [], set()
+    for u in evidence:
+        if u not in seen:
+            seen.add(u)
+            dedup.append(u)
+    evidence = dedup
+
+    vendor, vendor_url, conf = best_vendor_from_evidence(evidence)
+
+    # Notes adjustments:
+    if vendor.startswith("Affiliate"):
+        notes.append("Top evidence appears affiliate/OTA; may not reflect official CRS.")
+    if vendor == "Unknown":
+        notes.append("No strong vendor fingerprint found; evidence may be generic booking paths.")
+
+    return BookingFinding(
+        hotel_name=hotel_name,
+        evidence_urls=evidence[:80],
+        vendor=vendor,
+        vendor_evidence_url=vendor_url,
+        confidence=conf,
+        notes=" ".join(notes)[:2000],
+    )
+
+# --- Excel output ---
+def write_excel(filename: str, rows: List[dict]) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Hotels"
+
+    headers = [
+        "Hotel Name",
+        "ZoomInfo Category",
+        "ZoomInfo Score",
+        "GDS Chain Code",
+        "Booking Vendor",
+        "Vendor Evidence URL",
+        "Confidence",
+        "Notes",
+    ]
+    ws.append(headers)
+
+    for r in rows:
+        ws.append([
+            r.get("hotel_name", ""),
+            r.get("zoominfo_category", ""),
+            r.get("zoominfo_score", ""),
+            r.get("gds_chain_code", ""),
+            r.get("booking_vendor", ""),
+            r.get("vendor_evidence_url", ""),
+            r.get("confidence", ""),
+            r.get("notes", ""),
+        ])
+
+    # widths
+    widths = [40, 28, 16, 16, 28, 70, 12, 70]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64 + i)].width = w
+
+    wb.save(os.path.join(ART_DIR, filename))
+
+async def main():
     if not EMAIL_INPUT:
         write_text("RUN_STATUS.txt", "EMAIL_INPUT missing\n")
         print("❌ EMAIL_INPUT missing.")
         return
 
-    hotel_name = await extract_hotel_name(EMAIL_INPUT)
-    print(f"🏨 Property: {hotel_name}")
+    mode = detect_input_mode(EMAIL_INPUT)
+    properties: List[PropertyRow] = []
 
-    # Step 1: Chain code
-    chain_code = await gemini_chain_code_only(hotel_name)
-    write_text("CHAIN_CODE.txt", chain_code + "\n")
-    print(f"✅ Chain code: {chain_code}")
-
-    # Step 2: Booking engine link discovery (free sources)
-    candidates: List[str] = []
-
-    # A) TravelWeekly hotel page -> booking-ish links
-    tw_url = await travelweekly_internal_search(hotel_name)
-    if tw_url:
-        print(f"📰 TravelWeekly hotel page: {tw_url}")
-        status, tw_html = await fetch(tw_url, timeout_s=25.0)
-        if status < 400 and tw_html:
-            tw_links = extract_bookingish_links_from_html(tw_html, tw_url)
-            candidates.extend(tw_links)
-
-    # B) DuckDuckGo results (HTML + Lite fallback)
-    for q in ddg_queries(hotel_name):
-        links = await ddg_html_search(q)
-        if not links:
-            links = await ddg_lite_search(q)
-        for u in links[:20]:
-            u2 = normalize_url(u)
-            if u2 and (looks_like_booking_url(u2) or is_vendor(u2) or is_affiliate(u2)):
-                candidates.append(u2)
-
-    # C) Gemini suggestions (not browsing, just candidate URLs)
-    candidates.extend(await gemini_booking_urls_only(hotel_name))
-
-    # De-dupe
-    dedup, seen = [], set()
-    for u in candidates:
-        u = normalize_url(u)
-        if u and u not in seen:
-            seen.add(u)
-            dedup.append(u)
-
-    # Save what we tried
-    write_json("BOOKING_CANDIDATES.json", {"hotel": hotel_name, "candidates": dedup})
-
-    # Pick best reachable non-bot-wall link
-    ranked = sorted([(u, score_candidate(u)) for u in dedup], key=lambda x: x[1], reverse=True)
-    write_json("BOOKING_CANDIDATES_RANKED.json", {"hotel": hotel_name, "ranked": ranked})
-
-    reachable_ranked = await filter_reachable_nonblocked([u for u, _ in ranked], max_check=25)
-    booking_url = reachable_ranked[0][0] if reachable_ranked else ""
-
-    notes = ""
-    if booking_url:
-        notes = "Booking URL found (best reachable non-bot-wall candidate)."
-        print(f"✅ Booking URL: {booking_url}")
-        write_text("BOOKING_ENGINE_URL.txt", booking_url + "\n")
-        write_text("RUN_STATUS.txt", f"booking_url={booking_url}\n")
+    if mode == "list":
+        properties = parse_zoominfo_email(EMAIL_INPUT)
+        if not properties:
+            # fallback to single name if parsing failed
+            properties = [PropertyRow(hotel_name=EMAIL_INPUT)]
     else:
-        notes = "No reachable booking URL found (candidates blocked or unreachable)."
-        print("❌ Booking URL not found (reachable).")
-        write_text("BOOKING_ENGINE_URL.txt", "NOT_FOUND\n")
-        write_text("RUN_STATUS.txt", "no_booking_url_found\n")
+        properties = [PropertyRow(hotel_name=EMAIL_INPUT)]
 
-    # Write the Excel row (your end goal format)
-    write_excel_single_row(
-        "HOTEL_OUTPUT.xlsx",
-        hotel_name=hotel_name,
-        chain_code=chain_code,
-        booking_url=booking_url or "NOT_FOUND",
-        notes=notes,
-    )
-    print("✅ Saved: screenshots/HOTEL_OUTPUT.xlsx")
+    # De-dupe and keep order
+    seen = set()
+    clean_props = []
+    for p in properties:
+        k = p.hotel_name.strip().lower()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        clean_props.append(p)
+    properties = clean_props
+
+    write_json("PARSED_PROPERTIES.json", [asdict(p) for p in properties])
+    print(f"✅ Parsed {len(properties)} propertie(s).")
+
+    output_rows = []
+    all_booking_findings = []
+
+    # Process sequentially for stability (easy to parallelize later)
+    for idx, prop in enumerate(properties, start=1):
+        hotel_name = prop.hotel_name.strip()
+        print(f"\n🏨 [{idx}/{len(properties)}] Processing: {hotel_name}")
+
+        # 1) GDS chain code
+        chain_code = await gemini_chain_code_only(hotel_name)
+        print(f"   ✅ Chain code: {chain_code}")
+
+        # 2) Booking vendor fingerprint
+        finding = await fingerprint_booking_vendor(hotel_name)
+        all_booking_findings.append(asdict(finding))
+        print(f"   ✅ Booking vendor: {finding.vendor} ({finding.confidence})")
+
+        output_rows.append({
+            "hotel_name": hotel_name,
+            "zoominfo_category": prop.category or "",
+            "zoominfo_score": prop.score if prop.score is not None else "",
+            "gds_chain_code": chain_code,
+            "booking_vendor": finding.vendor,
+            "vendor_evidence_url": finding.vendor_evidence_url,
+            "confidence": finding.confidence,
+            "notes": finding.notes,
+        })
+
+        # Update run status continuously so you always get something
+        write_text("RUN_STATUS.txt", f"processed {idx}/{len(properties)}\n")
+
+    write_json("BOOKING_EVIDENCE.json", all_booking_findings)
+    write_excel("HOTEL_OUTPUT.xlsx", output_rows)
+
+    write_text("RUN_STATUS.txt", "done\n")
+    print("\n✅ Done. Saved: screenshots/HOTEL_OUTPUT.xlsx")
 
 if __name__ == "__main__":
-    print("✅ ENTERED __main__")
     try:
         asyncio.run(main())
     except Exception as e:
